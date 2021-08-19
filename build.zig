@@ -7,6 +7,8 @@ pub fn build(b: *std.build.Builder) void {
     const exe = b.addExecutable("zig", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
+    exe.linkSystemLibrary("lmdb"); // It's just two C files, may be easier to include directly.
+    exe.linkLibC();
     exe.install();
 
     const run_cmd = exe.run();
