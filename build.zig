@@ -1,14 +1,25 @@
+// SPDX-FileCopyrightText: 2021 Kirjastonhoitaja <thekirjastonhoitaja@protonmail.com>
+// SPDX-License-Identifier: copyleft-next-0.3.1
+
 const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("zig", "src/main.zig");
+    const exe = b.addExecutable("jakoi", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
-    exe.linkSystemLibrary("lmdb"); // It's just two C files, may be easier to include directly.
     exe.linkLibC();
+
+    if (b.option(bool, "system-lmdb", "Link to system-provided LMDB") orelse false) {
+        exe.linkSystemLibrary("lmdb");
+    } else {
+        exe.addIncludeDir("deps/lmdb/libraries/liblmdb");
+        exe.addCSourceFile("deps/lmdb/libraries/liblmdb/mdb.c", &.{});
+        exe.addCSourceFile("deps/lmdb/libraries/liblmdb/midl.c", &.{});
+    }
+
     exe.install();
 
     const run_cmd = exe.run();

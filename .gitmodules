@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2021 Kirjastonhoitaja <thekirjastonhoitaja@protonmail.com>
 # SPDX-License-Identifier: copyleft-next-0.3.1
 
-zig-out/
-zig-cache/
+[submodule "deps/lmdb"]
+	path = deps/lmdb
+	url = https://github.com/LMDB/lmdb

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2021 Kirjastonhoitaja <thekirjastonhoitaja@protonmail.com>
+// SPDX-License-Identifier: copyleft-next-0.3.1
+//
 // LMDB key format:
 //
 // 0 0
