@@ -4,11 +4,14 @@
 const std = @import("std");
 const db = @import("db.zig");
 const main = @import("main.zig");
+const config = @import("config.zig");
+const blake3 = @import("blake3.zig");
+const util = @import("util.zig");
 
 
 const DirQueue = struct {
-    lst: std.ArrayList(Entry) = std.ArrayList(Entry).init(main.allocator),
-    names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(main.allocator),
+    lst: std.ArrayList(Entry) = std.ArrayList(Entry).init(util.allocator),
+    names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(util.allocator),
     idx: usize = 0,
     dir: std.fs.Dir,
 
@@ -32,8 +35,8 @@ const DirQueue = struct {
 
 const Listing = struct {
     dirs: DirQueue,
-    files: std.ArrayList(File) = std.ArrayList(File).init(main.allocator),
-    names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(main.allocator),
+    files: std.ArrayList(File) = std.ArrayList(File).init(util.allocator),
+    names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(util.allocator),
 
     const File = struct { name: []const u8, lastmod: u64, size: u64 };
 
@@ -41,20 +44,23 @@ const Listing = struct {
         return std.mem.lessThan(u8, a.name, b.name);
     }
 
-    fn get(dir: std.fs.Dir) !Listing {
+    fn get(dir: std.fs.Dir, path: *util.Path) !Listing {
         var l = Listing{ .dirs = .{ .dir = dir }};
         errdefer l.deinit();
 
         var it = dir.iterate();
         while (try it.next()) |entry| {
+            try path.push(entry.name);
+            defer path.pop();
+
             // TODO symlink following option
             const stat = std.os.fstatat(dir.fd, entry.name, std.os.AT_SYMLINK_NOFOLLOW) catch |e| {
-                std.log.info("Unable to stat {s}: {}, skipping", .{entry.name, e});
+                std.log.info("Unable to stat {}: {}, skipping", .{path, e});
                 continue;
             };
             const isdir = std.os.system.S_ISDIR(stat.mode);
             if (!isdir and !std.os.system.S_ISREG(stat.mode)) {
-                std.log.debug("Skipping non-regular file: {s}", .{entry.name});
+                std.log.debug("Skipping non-regular file: {}", .{path});
                 continue;
             }
             if (isdir) {
@@ -83,7 +89,7 @@ const Listing = struct {
 };
 
 
-fn storeListing(t: db.Txn, id: u64, lst: *Listing) !void {
+fn storeListing(t: db.Txn, id: u64, lst: *Listing, path: *util.Path) !void {
     var dirs = lst.dirs.lst.items;
     var files = lst.files.items;
     var dirIdx: usize = 0;
@@ -106,7 +112,7 @@ fn storeListing(t: db.Txn, id: u64, lst: *Listing) !void {
                 switch (ent.val()) {
                     .dir => |d| dir.*.id = d.*,
                     else => {
-                        try iter.del(ent);
+                        try iter.del(ent, path);
                         dir.*.id = try iter.addDir(dir.*.name);
                     }
                 }
@@ -130,13 +136,13 @@ fn storeListing(t: db.Txn, id: u64, lst: *Listing) !void {
                     .hashed   => |f| file.lastmod > f.lastmod or f.size != file.size,
                 };
                 if (readd) {
-                    try iter.del(ent); // technically don't need this if ent is unhashed.
+                    try iter.del(ent, path);
                     try iter.addFile(file.name, file.lastmod, file.size);
                 }
                 continue;
             }
         }
-        try iter.del(ent);
+        try iter.del(ent, path);
     }
 
     while (dirIdx < dirs.len) : (dirIdx += 1)
@@ -146,30 +152,120 @@ fn storeListing(t: db.Txn, id: u64, lst: *Listing) !void {
         try iter.addFile(files[fileIdx].name, files[fileIdx].lastmod, files[fileIdx].size);
 }
 
-fn scanDir(id: u64, parent: std.fs.Dir, name: []const u8) !DirQueue {
-    var dir = try parent.openDir(name, .{.iterate=true});
+fn scanDir(id: u64, parent: ?std.fs.Dir, path: *util.Path, name: []const u8) !DirQueue {
+    if (parent != null) try path.push(name);
+    errdefer if (parent != null) path.pop();
+    var dir = try (parent orelse std.fs.cwd()).openDir(name, .{.iterate=true});
 
-    var lst = try Listing.get(dir);
+    var lst = try Listing.get(dir, path);
     errdefer lst.deinit();
-    try db.txn(.rw, storeListing, .{id, &lst});
+    try db.txn(.rw, storeListing, .{id, &lst, path});
 
     lst.files.deinit();
     lst.names.deinit();
     return lst.dirs;
 }
 
-pub fn scan(path: []const u8) !void {
-    var stack = std.ArrayList(DirQueue).init(main.allocator);
+pub fn scan() !void {
+    var stack = std.ArrayList(DirQueue).init(util.allocator);
     defer stack.deinit();
 
-    try stack.append(try scanDir(0, std.fs.cwd(), path));
+    var path = util.Path{};
+
+    try stack.append(try scanDir(0, null, &path, config.public_dir));
     while (stack.items.len > 0) {
         if (stack.items[stack.items.len-1].next()) |e| {
-            if (scanDir(e.id, stack.items[stack.items.len-1].dir, e.name)) |q|
+            if (scanDir(e.id, stack.items[stack.items.len-1].dir, &path, e.name)) |q|
                 try stack.append(q)
             else |err|
-                std.log.info("Error reading {s}: {}, skipping.", .{ e.name, err });
-        } else
+                std.log.info("Error reading {}: {}, skipping.", .{ path, err });
+        } else {
+            path.pop();
             stack.pop().deinit();
+        }
     }
+}
+
+
+fn hashPopulate(t: db.Txn) !void {
+    db.hash_queue.reset();
+    try db.hash_queue.populate(t);
+}
+
+fn hashNext(t: db.Txn) !?db.hash_queue.Entry {
+    return db.hash_queue.next(t);
+}
+
+// TODO: It may be worth batching these into fewer transactions, especially for small files.
+fn hashStore(t: db.Txn, e: db.hash_queue.Entry, b3: [32]u8, pieces: ?[]const u8) !void {
+    return db.hash_queue.store(t, e, b3, pieces);
+}
+
+fn hashFile(ent: db.hash_queue.Entry) !void {
+    std.log.debug("Hashing {s}", .{ent.path});
+
+    // Short-circuit empty files, mmap() doesn't like those.
+    if (ent.size == 0)
+        return db.txn(.rw, hashStore, .{ ent, blake3.hashPiece(0, "").root(), null });
+
+    var fspath = try config.virtualToFs(ent.path);
+    var fd = try std.fs.cwd().openFileZ(try fspath.sliceZ(), .{});
+    defer fd.close();
+
+    // TODO: Validate if ent.size is still correct.
+    // (Still subject to an unavoidable race condition, but may handle a few cases)
+    // TODO: Make this work on Windows.
+    // TODO: Handle large files on 32bit systems.
+    // TODO: Non-mmap fallback? Even fixing the above, mmap /is/ slightly fragile.
+    var map = try std.os.mmap(null, ent.size, std.os.PROT_READ, std.os.MAP_PRIVATE, fd.handle, 0);
+    defer std.os.munmap(map);
+
+    const piece_size = config.min_piece_size;
+    const num_pieces = std.math.divCeil(u64, ent.size, piece_size) catch unreachable;
+    if (num_pieces == 1) {
+        const b3 = blake3.hashPiece(0, map).root();
+        return db.txn(.rw, hashStore, .{ ent, b3, null });
+    }
+
+    var piecedata = try std.ArrayList(u8).initCapacity(util.allocator, 8+32*num_pieces);
+    defer piecedata.deinit();
+    piecedata.appendSlice(std.mem.asBytes(&ent.size)) catch unreachable;
+    var i: u64 = 0;
+    while (i < num_pieces) : (i += 1)
+        piecedata.appendSlice(&blake3.hashPiece(
+            i*piece_size/blake3.CHUNK_LEN,
+            map[i*piece_size..std.math.min(ent.size, (i+1)*piece_size)]
+        ).chainingValue()) catch unreachable;
+    const b3 = blake3.mergePieces(piecedata.items[8..]).root();
+    return db.txn(.rw, hashStore, .{ ent, b3, piecedata.items });
+}
+
+// TODO: For large files, we can maintain a separate "piece queue", consulted
+// before db.hash_queue, so that multiple threads can work on the same file.
+fn hashThread() void {
+    while (true) {
+        var ent = db.txn(.ro, hashNext, .{}) catch |e| {
+            std.log.warn("Hash thread exited with error: {}", .{e});
+            return;
+        } orelse return;
+        defer ent.deinit();
+        hashFile(ent) catch |e|
+            std.log.warn("Error hashing {s}: {}", .{ent.path, e});
+    }
+}
+
+pub fn hash() !void {
+    try db.txn(.ro, hashPopulate, .{});
+    var threads = std.ArrayList(std.Thread).init(util.allocator);
+    defer threads.deinit();
+    var i = config.hash_threads;
+    while (i > 0) : (i -= 1) {
+        // We do call a few recursive functions, but 1M should be more than enough.
+        var t = try std.Thread.spawn(.{ .stack_size = 1024*1024 }, hashThread, .{});
+        var buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "Hasher #{}", .{i})) |name| t.setName(name) catch {}
+        else |_| {}
+        try threads.append(t);
+    }
+    for (threads.items) |*t| t.join();
 }

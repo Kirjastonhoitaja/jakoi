@@ -3,13 +3,20 @@
 
 const std = @import("std");
 const db = @import("db.zig");
+const util = @import("util.zig");
 const scan = @import("scan.zig");
+const blake3 = @import("blake3.zig");
 
-pub const allocator = std.heap.c_allocator;
 
 pub fn main() anyerror!void {
-    try db.open("test");
-    try scan.scan("zig-cache");
-
+    try db.open();
+    try scan.scan();
+    try scan.hash();
     std.log.info("All your codebase are belong to us.", .{});
+}
+
+
+test "" {
+    _ = blake3;
+    _ = util;
 }

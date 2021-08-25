@@ -38,6 +38,10 @@
 //   For hash -> path lookups.
 
 const std = @import("std");
+const config = @import("config.zig");
+const util = @import("util.zig");
+const blake3 = @import("blake3.zig");
+const main = @import("main.zig");
 const c = @cImport({ @cInclude("errno.h"); @cInclude("lmdb.h"); });
 
 var db_env: ?*c.MDB_env = null;
@@ -160,6 +164,13 @@ pub const Txn = struct {
         return fromVal(val);
     }
 
+    fn del(t: Txn, key: []const u8) !bool {
+        const rc = c.mdb_del(t.t, db_dbi, &toVal(key), null);
+        if (rc == c.MDB_NOTFOUND) return false;
+        try rcErr(rc);
+        return true;
+    }
+
     // Beware: Identifiers given out in a transaction that has not been
     // (successfully) committed may be re-used later on.
     pub fn nextSequence(t: Txn) !u64 {
@@ -170,6 +181,13 @@ pub const Txn = struct {
 
     pub fn dirIter(t: Txn, id: u64) DirIter {
         return DirIter{ .t = t, .id = id };
+    }
+
+    pub fn hashPathIter(t: Txn, b3: [32]u8) HashPathIter {
+        var it = HashPathIter{ .t = t };
+        it.prefix[0] = 4;
+        it.prefix[1..33].* = b3;
+        return it;
     }
 };
 
@@ -187,7 +205,7 @@ pub const DirEntry = struct {
     value: []const u8,
 
     pub const Unhashed = packed struct { lastmod: u64, size: u64 };
-    pub const Hashed = packed struct { lastmod: u64, size: u64, blake3: [32]u8 };
+    pub const Hashed = packed struct { lastmod: u64, size: u64, b3: [32]u8 };
     pub const Dir = u64;
     pub const Value = union(enum) {
         unhashed: *const Unhashed,
@@ -245,6 +263,25 @@ pub const DirIter = struct {
         return ent;
     }
 
+    // Set the cursor such that the following call to next() will return the
+    // entry *after* the given name.
+    pub fn skip(self: *DirIter, name: []const u8) !void {
+        var buf: [500]u8 = undefined;
+        var seek = dirKey(&buf, self.id, name);
+        var key = toVal(seek);
+        var value: c.MDB_val = undefined;
+
+        if (self.cursor == null) try rcErr(c.mdb_cursor_open(self.t.t, db_dbi, &self.cursor));
+        const rc = c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_SET_RANGE);
+        if (rc == c.MDB_NOTFOUND) return;
+        try rcErr(rc);
+
+        // If we're not on the given entry, that means we're on the entry that
+        // next() should return. Rewind one.
+        if (!std.mem.eql(u8, seek, fromVal(key)))
+            try rcErr(c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_PREV));
+    }
+
     // Add a new subdir, returns a newly allocated dir_id.
     // Cursor will be positioned on the new dir.
     pub fn addDir(self: *DirIter, name: []const u8) !u64 {
@@ -272,16 +309,34 @@ pub const DirIter = struct {
     }
 
     // Delete the entry last returned by next().
-    pub fn del(self: *DirIter, ent: DirEntry) MdbError!void {
-        std.log.debug("Deleting from dir#{}: {s}", .{ self.id, ent.name() });
+    pub fn del(self: *DirIter, ent: DirEntry, parent: *util.Path) (MdbError||util.Path.Error)!void {
+        try parent.push(ent.name());
+        defer parent.pop();
+        std.log.debug("Deleting from dir#{}: {}", .{ self.id, parent });
 
         switch (ent.val()) {
-            .unhashed => {},
-            .hashed => {}, // TODO: Delete hash data
+            .unhashed => hash_queue.reset(),
+            .hashed => |f| {
+                var buf: [41]u8 = undefined;
+                buf[0] = 4;
+                buf[0..32].* = f.b3;
+                buf[33..41].* = blake3.hashPiece(0, parent.slice()).root()[0..8].*;
+                _ = try self.t.del(buf[0..41]);
+
+                // Eagerly delete metadata associated with this blake3 hash if we don't have any other paths with the same hash.
+                var it = self.t.hashPathIter(f.b3);
+                defer it.deinit();
+                if (null == try it.next()) {
+                    buf[0] = 2;
+                    _ = try self.t.del(buf[0..33]);
+                    buf[0] = 3;
+                    _ = try self.t.del(buf[0..33]);
+                }
+            },
             .dir => |dirid| {
                 var it = self.t.dirIter(dirid.*);
                 defer it.deinit();
-                while (try it.next()) |e| try it.del(e);
+                while (try it.next()) |e| try it.del(e, parent);
             },
         }
         try rcErr(c.mdb_cursor_del(self.cursor, 0));
@@ -289,6 +344,144 @@ pub const DirIter = struct {
 
     pub fn deinit(self: *DirIter) void {
         c.mdb_cursor_close(self.cursor);
+    }
+};
+
+
+pub const HashPathIter = struct {
+    t: Txn,
+    prefix: [33]u8 = undefined,
+    cursor: ?*c.MDB_cursor = null,
+
+    pub fn next(self: *HashPathIter) !?[]const u8 {
+        var key: c.MDB_val = toVal(&self.prefix);
+        var value: c.MDB_val = undefined;
+
+        const op: c_uint = if (self.cursor == null) blk: {
+            try rcErr(c.mdb_cursor_open(self.t.t, db_dbi, &self.cursor));
+            break :blk c.MDB_SET_RANGE;
+        } else c.MDB_NEXT;
+
+        const rc = c.mdb_cursor_get(self.cursor, &key, &value, op);
+        if (rc == c.MDB_NOTFOUND) return null;
+        try rcErr(rc);
+        if (!std.mem.startsWith(u8, fromVal(key), &self.prefix)) return null;
+        return fromVal(value);
+    }
+
+    pub fn deinit(self: *HashPathIter) void {
+        c.mdb_cursor_close(self.cursor);
+    }
+};
+
+
+pub const hash_queue = struct {
+    var total_size: u64 = 0;
+    var total_files: u32 = 0;
+    var cache = std.ArrayList(Entry).init(util.allocator);
+    var last_path: ?[]u8 = null;
+    var mutex = std.Thread.Mutex{}; // Protects the variables above. Functions in this struct will acquire the mutex on their own.
+
+    pub const Entry = struct {
+        dir_id: u64,
+        size: u64,
+        path: []u8,
+
+        pub fn deinit(self: Entry) void {
+            util.allocator.free(self.path);
+        }
+    };
+
+    // Reset the in-memory hash queue, next() will return null until populate() is called again.
+    pub fn reset() void {
+        var lock = mutex.acquire();
+        defer lock.release();
+        total_size = 0;
+        total_files = 0;
+        for (cache.items) |e| e.deinit();
+        if (last_path) |l| util.allocator.free(l);
+        last_path = null;
+        cache.clearAndFree();
+    }
+
+    // Each unique to-be-hashed path is only returned once in a single run.
+    // Caller is given ownership of the returned Entry and must call deinit().
+    pub fn next(t: Txn) !?Entry {
+        var lock = mutex.acquire();
+        defer lock.release();
+        if (cache.items.len == 0 and last_path != null) try populateLocked(t);
+        return cache.popOrNull();
+    }
+
+    pub fn store(t: Txn, e: Entry, b3: [32]u8, pieces: ?[]const u8) !void {
+        // Could be a stray thread calling done() after this file has been
+        // removed/modified, so make sure it still exists and we still want its
+        // hash.
+        var buf: [500]u8 = undefined;
+        const key = dirKey(&buf, e.dir_id, std.fs.path.basenamePosix(e.path));
+        const lastmod = switch ((DirEntry{ .key = key, .value = (try t.get(key)) orelse return }).val()) {
+            .unhashed => |f| if (f.size == e.size) f.lastmod else return,
+            else => return
+        };
+        const hashed = DirEntry.Hashed{ .lastmod = lastmod, .size = e.size, .b3 = b3 };
+        try t.put(key, (DirEntry.Value{ .hashed = &hashed }).bytes());
+
+        buf[0] = 2;
+        buf[1..33].* = b3;
+        if (pieces) |p| try t.put(buf[0..33], p);
+        buf[0] = 4;
+        buf[33..41].* = blake3.hashPiece(0, e.path).root()[0..8].*;
+        try t.put(buf[0..41], e.path);
+
+        // TODO: CBOR metadata
+
+        var lock = mutex.acquire();
+        defer lock.release();
+        if (total_size > e.size) total_size -= e.size;
+        if (total_files > 0) total_files -= 1;
+    }
+
+    fn populateRec(t: Txn, id: u64, path: *util.Path, last: []const u8) (MdbError || util.Path.Error)!void {
+        var it = t.dirIter(id);
+        defer it.deinit();
+        if (last.len > 0) try it.skip(util.pathHead(last));
+        while (try it.next()) |e| {
+            try path.push(e.name());
+            defer path.pop();
+            switch (e.val()) {
+                .unhashed => |f| {
+                    if (last_path == null) {
+                        total_files += 1;
+                        total_size = std.math.add(u64, total_size, f.size) catch total_size;
+                    }
+                    if (cache.items.len < 100)
+                        try cache.append(Entry{ .dir_id = it.id, .size = f.size, .path = try util.allocator.dupe(u8, path.slice())});
+                },
+                .dir => |d| try populateRec(t, d.*, path, util.pathTail(last)),
+                else => {}
+            }
+            if (cache.items.len >= 100 and last_path != null) return;
+        }
+    }
+
+    fn populateLocked(t: Txn) !void {
+        var path = util.Path{};
+        try populateRec(t, 0, &path, last_path orelse "");
+        // The queue is processed starting from the last entry, so reversing
+        // the queue makes it go in a nicer order.
+        std.mem.reverse(Entry, cache.items);
+        if (last_path) |l| util.allocator.free(l);
+        last_path = if (cache.items.len > 0) try util.allocator.dupe(u8, cache.items[0].path) else null;
+        std.log.debug("Hash queue length: {} files, {:.2}", .{ total_files, std.fmt.fmtIntSizeBin(total_size) });
+    }
+
+    // Has two modes:
+    // - If last_path = null, will fill 'cache' and scan the entire database to get the total_* stats.
+    // - Otherwise, will continue from last_path and only fill 'cache'.
+    pub fn populate(t: Txn) !void {
+        var lock = mutex.acquire();
+        defer lock.release();
+        return populateLocked(t);
     }
 };
 
@@ -305,8 +498,11 @@ fn openDb(t: Txn) !void {
     }
 }
 
-pub fn open(path: [:0]const u8) !void {
-    try std.fs.cwd().makePath(path);
+pub fn open() !void {
+    var path = util.Path{};
+    try path.push(config.store_dir);
+    try path.push("db");
+    try std.fs.cwd().makePath(path.slice());
 
     try rcErr(c.mdb_env_create(&db_env));
     errdefer c.mdb_env_close(db_env);
@@ -324,7 +520,7 @@ pub fn open(path: [:0]const u8) !void {
     // that kind of durability and it completely kills performance of small
     // transactions, which we need in order to handle dynamic map resizes.
     // Maybe add a config option for improved durability on unreliable devices?
-    try rcErr(c.mdb_env_open(db_env, path, c.MDB_NOSYNC, 0o600));
+    try rcErr(c.mdb_env_open(db_env, path.slice().ptr, c.MDB_NOSYNC, 0o600));
 
     return txn(.rw, openDb, .{});
 }
