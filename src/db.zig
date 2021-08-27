@@ -98,55 +98,97 @@ pub const Mode = enum { ro, rw };
 // kinda supported, but only if it is resumed on the same OS thread and no
 // other concurrent transactions are started on the same OS thread.
 //
-// ASSUMPTION: Only one transaction is active at a time. This assumption can be
-// relaxed quite easily by keeping track of an rwmutex when adjusting the
-// mapsize.
-//
 // Type system sloppiness: cb must have the full rcErr() in its error set,
 // otherwise this won't compile. The return type of this function also includes
 // MdbMapResized and MdbMapFull, even though those will never be returned.
 pub fn txn(comptime mode: Mode, cb: anytype, args: anytype) @typeInfo(@TypeOf(cb)).Fn.return_type.? {
     while (true) {
-        var t = Txn{};
-        try rcErr(c.mdb_txn_begin(db_env, null, if (mode == .ro) c.MDB_RDONLY else 0, &t.t));
+        var t = try txn_impl.start(if (mode == .ro) c.MDB_RDONLY else 0);
         const r = @call(.{}, cb, .{t} ++ args);
 
-        if (txnFinal(t, if (r) null else |e| e)) |v| {
+        if (txn_impl.final(t, if (r) null else |e| e)) |v| {
             if (v) return r;
         } else |e|
             return @errSetCast(@typeInfo(@typeInfo(@TypeOf(cb)).Fn.return_type.?).ErrorUnion.error_set, e);
     }
 }
 
-// Non-generic helper function for txn() in order to hopefully reduce code bloat.
-fn txnFinal(t: Txn, err: ?anyerror) anyerror!bool {
-    const e = blk: {
-        if (err) |e| {
-            c.mdb_txn_abort(t.t);
-            break :blk e;
-        } else {
-            if (rcErr(c.mdb_txn_commit(t.t))) return true
-            else |e| break :blk e;
-        }
-    };
+const txn_impl = struct {
+    // Complex machinery to ensure we can safely resize the LMDB map. :(
+    var resizing: bool = false;
+    var active_txn: usize = 0;
+    var lock = std.Thread.Mutex{};
+    var canresize = std.Thread.Condition{}; // active_txn == 1
+    var resized = std.Thread.Condition{}; // resizing == false
 
-    switch (e) {
-        error.MdbMapResized => {
-            std.log.debug("LMDB map has been resized by an external process", .{});
-            try rcErr(c.mdb_env_set_mapsize(db_env, 0));
-            return false;
-        },
-        error.MdbMapFull => {
-            var nfo: c.MDB_envinfo = undefined;
-            _ = c.mdb_env_info(db_env, &nfo);
-            const new = nfo.me_mapsize + nfo.me_mapsize/2;
-            std.log.debug("LMDB map resized from {} to {}", .{nfo.me_mapsize, new});
-            try rcErr(c.mdb_env_set_mapsize(db_env, new));
-            return false;
-        },
-        else => return e
+    // decrement active_txn
+    fn release() void {
+        const l = lock.acquire();
+        active_txn -= 1;
+        const signal = active_txn == 1;
+        l.release();
+        if (signal) canresize.signal();
     }
-}
+
+    // Try to resize the map, assumes we still count as an active_txn.
+    fn resize(new_size: u64) !void {
+        const l = lock.acquire();
+        if (resizing) { // Let the other thread do its thing.
+            l.release();
+            return;
+        }
+        resizing = true;
+        while (active_txn > 1) canresize.wait(&lock);
+        const rc = c.mdb_env_set_mapsize(db_env, new_size);
+        resizing = false;
+        l.release();
+        resized.broadcast();
+        return rcErr(rc);
+    }
+
+    fn start(flags: c_uint) !Txn {
+        const l = lock.acquire();
+        while (resizing) resized.wait(&lock);
+        active_txn += 1;
+        l.release();
+
+        errdefer release();
+        var t = Txn{};
+        try rcErr(c.mdb_txn_begin(db_env, null, flags, &t.t));
+        return t;
+    }
+
+    fn final(t: Txn, err: ?anyerror) anyerror!bool {
+        defer release();
+
+        const e = blk: {
+            if (err) |e| {
+                c.mdb_txn_abort(t.t);
+                break :blk e;
+            } else {
+                if (rcErr(c.mdb_txn_commit(t.t))) return true
+                else |e| break :blk e;
+            }
+        };
+
+        switch (e) {
+            error.MdbMapResized => {
+                std.log.debug("LMDB map has been resized by an external process", .{});
+                try resize(0);
+                return false;
+            },
+            error.MdbMapFull => {
+                var nfo: c.MDB_envinfo = undefined;
+                _ = c.mdb_env_info(db_env, &nfo);
+                const new = nfo.me_mapsize + nfo.me_mapsize/2;
+                std.log.debug("LMDB map resized from {} to {}", .{nfo.me_mapsize, new});
+                try resize(new);
+                return false;
+            },
+            else => return e
+        }
+    }
+};
 
 
 pub const Txn = struct {
@@ -264,8 +306,9 @@ pub const DirIter = struct {
     }
 
     // Set the cursor such that the following call to next() will return the
-    // entry *after* the given name.
-    pub fn skip(self: *DirIter, name: []const u8) !void {
+    // entry with the given name, or the entry after that if there is no exact
+    // match..
+    pub fn skipTo(self: *DirIter, name: []const u8) !void {
         var buf: [500]u8 = undefined;
         var seek = dirKey(&buf, self.id, name);
         var key = toVal(seek);
@@ -275,11 +318,7 @@ pub const DirIter = struct {
         const rc = c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_SET_RANGE);
         if (rc == c.MDB_NOTFOUND) return;
         try rcErr(rc);
-
-        // If we're not on the given entry, that means we're on the entry that
-        // next() should return. Rewind one.
-        if (!std.mem.eql(u8, seek, fromVal(key)))
-            try rcErr(c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_PREV));
+        try rcErr(c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_PREV));
     }
 
     // Add a new subdir, returns a newly allocated dir_id.
@@ -382,6 +421,8 @@ pub const hash_queue = struct {
     var last_path: ?[]u8 = null;
     var mutex = std.Thread.Mutex{}; // Protects the variables above. Functions in this struct will acquire the mutex on their own.
 
+    const MAX_CACHE: usize = 100;
+
     pub const Entry = struct {
         dir_id: u64,
         size: u64,
@@ -444,7 +485,11 @@ pub const hash_queue = struct {
     fn populateRec(t: Txn, id: u64, path: *util.Path, last: []const u8) (MdbError || util.Path.Error)!void {
         var it = t.dirIter(id);
         defer it.deinit();
-        if (last.len > 0) try it.skip(util.pathHead(last));
+        if (last.len > 0) {
+            try it.skipTo(util.pathHead(last));
+            // If "last" refers to a file, make sure we grab the entry *after* that.
+            if (util.pathTail(last).len == 0) _ = try it.next();
+        }
         while (try it.next()) |e| {
             try path.push(e.name());
             defer path.pop();
@@ -454,24 +499,29 @@ pub const hash_queue = struct {
                         total_files += 1;
                         total_size = std.math.add(u64, total_size, f.size) catch total_size;
                     }
-                    if (cache.items.len < 100)
+                    if (cache.items.len < MAX_CACHE)
                         try cache.append(Entry{ .dir_id = it.id, .size = f.size, .path = try util.allocator.dupe(u8, path.slice())});
                 },
-                .dir => |d| try populateRec(t, d.*, path, util.pathTail(last)),
+                .dir => |d| try populateRec(t, d.*, path,
+                    if (std.mem.eql(u8, e.name(), util.pathHead(last))) util.pathTail(last) else ""),
                 else => {}
             }
-            if (cache.items.len >= 100 and last_path != null) return;
+            if (cache.items.len >= MAX_CACHE and last_path != null) return;
         }
     }
 
     fn populateLocked(t: Txn) !void {
         var path = util.Path{};
+        if (last_path == null) {
+            total_files = 0;
+            total_size = 0;
+        }
         try populateRec(t, 0, &path, last_path orelse "");
         // The queue is processed starting from the last entry, so reversing
         // the queue makes it go in a nicer order.
         std.mem.reverse(Entry, cache.items);
         if (last_path) |l| util.allocator.free(l);
-        last_path = if (cache.items.len > 0) try util.allocator.dupe(u8, cache.items[0].path) else null;
+        last_path = if (cache.items.len == MAX_CACHE) try util.allocator.dupe(u8, cache.items[0].path) else null;
         std.log.debug("Hash queue length: {} files, {:.2}", .{ total_files, std.fmt.fmtIntSizeBin(total_size) });
     }
 
