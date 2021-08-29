@@ -213,6 +213,23 @@ pub const Txn = struct {
         return true;
     }
 
+    const Entry = struct { key: []const u8, value: []const u8 };
+
+    // Open the cursor at the given key if it's null, otherwise get the next item.
+    fn curs_next(t: Txn, cursor: *?*c.MDB_cursor, key_slice: []const u8) !?Entry {
+        var key: c.MDB_val = toVal(key_slice);
+        var value: c.MDB_val = undefined;
+        const op: c_uint = if (cursor.* == null) blk: {
+            try rcErr(c.mdb_cursor_open(t.t, db_dbi, cursor));
+            break :blk c.MDB_SET_RANGE;
+        } else c.MDB_NEXT;
+
+        const rc = c.mdb_cursor_get(cursor.*, &key, &value, op);
+        if (rc == c.MDB_NOTFOUND) return null;
+        try rcErr(rc);
+        return Entry{ .key = fromVal(key), .value = fromVal(value) };
+    }
+
     // Beware: Identifiers given out in a transaction that has not been
     // (successfully) committed may be re-used later on.
     pub fn nextSequence(t: Txn) !u64 {
@@ -221,15 +238,43 @@ pub const Txn = struct {
         return v;
     }
 
+    pub fn getDirList(t: Txn) !?[32]u8 {
+        return if (try t.get(&[_]u8{0,2})) |v| v[0..32].* else null;
+    }
+
+    pub fn getHashList(t: Txn) !?[32]u8 {
+        return if (try t.get(&[_]u8{0,3})) |v| v[0..32].* else null;
+    }
+
+    pub fn setDirList(t: Txn, v: [32]u8) !void {
+        try t.put(&[_]u8{0,2}, &v);
+    }
+
+    pub fn setHashList(t: Txn, v: [32]u8, num: u64) !void {
+        if (num > 0) {
+            try t.put(&[_]u8{0,3}, &v);
+            try t.put(&[_]u8{0,4}, std.mem.asBytes(&num));
+        } else {
+            _ = try t.del(&[_]u8{0,3});
+            _ = try t.del(&[_]u8{0,4});
+        }
+    }
+
     pub fn dirIter(t: Txn, id: u64) DirIter {
         return DirIter{ .t = t, .id = id };
     }
 
+    // Iterate through all file paths that have the given blake3 hash. Order is semi-random.
     pub fn hashPathIter(t: Txn, b3: [32]u8) HashPathIter {
         var it = HashPathIter{ .t = t };
         it.prefix[0] = 4;
         it.prefix[1..33].* = b3;
         return it;
+    }
+
+    // Iterate through the blake3 hashes of all public files, ordered by hash.
+    pub fn hashIter(t: Txn) HashIter {
+        return HashIter{ .t = t };
     }
 };
 
@@ -289,18 +334,8 @@ pub const DirIter = struct {
 
     pub fn next(self: *DirIter) !?DirEntry {
         var buf: [9]u8 = undefined;
-        var key: c.MDB_val = toVal(dirKey(&buf, self.id, ""));
-        var value: c.MDB_val = undefined;
-
-        const op = if (self.cursor == null) blk: {
-            try rcErr(c.mdb_cursor_open(self.t.t, db_dbi, &self.cursor));
-            break :blk c.MDB_SET_RANGE;
-        } else c.MDB_NEXT;
-
-        const rc = c.mdb_cursor_get(self.cursor, &key, &value, @intCast(c_uint, op));
-        if (rc == c.MDB_NOTFOUND) return null;
-        try rcErr(rc);
-        const ent = DirEntry{ .key = fromVal(key), .value = fromVal(value) };
+        const v = (try self.t.curs_next(&self.cursor, dirKey(&buf, self.id, ""))) orelse return null;
+        const ent = DirEntry{ .key = v.key, .value = v.value };
         if (ent.id() != self.id) return null;
         return ent;
     }
@@ -319,6 +354,10 @@ pub const DirIter = struct {
         if (rc == c.MDB_NOTFOUND) return;
         try rcErr(rc);
         try rcErr(c.mdb_cursor_get(self.cursor, &key, &value, c.MDB_PREV));
+    }
+
+    pub fn reset(self: *DirIter) !void {
+        return self.skipTo("");
     }
 
     // Add a new subdir, returns a newly allocated dir_id.
@@ -393,22 +432,33 @@ pub const HashPathIter = struct {
     cursor: ?*c.MDB_cursor = null,
 
     pub fn next(self: *HashPathIter) !?[]const u8 {
-        var key: c.MDB_val = toVal(&self.prefix);
-        var value: c.MDB_val = undefined;
-
-        const op: c_uint = if (self.cursor == null) blk: {
-            try rcErr(c.mdb_cursor_open(self.t.t, db_dbi, &self.cursor));
-            break :blk c.MDB_SET_RANGE;
-        } else c.MDB_NEXT;
-
-        const rc = c.mdb_cursor_get(self.cursor, &key, &value, op);
-        if (rc == c.MDB_NOTFOUND) return null;
-        try rcErr(rc);
-        if (!std.mem.startsWith(u8, fromVal(key), &self.prefix)) return null;
-        return fromVal(value);
+        const v = (try self.t.curs_next(&self.cursor, &self.prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, v.key, &self.prefix)) return null;
+        return v.value;
     }
 
     pub fn deinit(self: *HashPathIter) void {
+        c.mdb_cursor_close(self.cursor);
+    }
+};
+
+
+pub const HashIter = struct {
+    t: Txn,
+    last: [32]u8 = [_]u8{0} ** 32,
+    cursor: ?*c.MDB_cursor = null,
+
+    pub fn next(self: *HashIter) !?[32]u8 {
+        while (true) {
+            const v = (try self.t.curs_next(&self.cursor, &[_]u8{4})) orelse return null;
+            if (v.key.len < 33 or v.key[0] != 4) return null;
+            if (std.mem.eql(u8, &self.last, v.key[1..33])) continue;
+            self.last = v.key[1..33].*;
+            return v.key[1..33].*;
+        }
+    }
+
+    pub fn deinit(self: *HashIter) void {
         c.mdb_cursor_close(self.cursor);
     }
 };

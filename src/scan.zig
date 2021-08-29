@@ -44,6 +44,15 @@ const Listing = struct {
         return std.mem.lessThan(u8, a.name, b.name);
     }
 
+    fn isValidName(n: []const u8) bool {
+        for (n) |c| switch (c) {
+            '/', '\\', 0...0x1f, 0x7f => return false,
+            else => {},
+        };
+        return !std.mem.eql(u8, n, ".") and !std.mem.eql(u8, n, "..")
+            and std.unicode.utf8ValidateSlice(n);
+    }
+
     fn get(dir: std.fs.Dir, path: *util.Path) !Listing {
         var l = Listing{ .dirs = .{ .dir = dir }};
         errdefer l.deinit();
@@ -52,6 +61,11 @@ const Listing = struct {
         while (try it.next()) |entry| {
             try path.push(entry.name);
             defer path.pop();
+
+            if (!isValidName(entry.name)) {
+                std.log.info("Invalid file name: {}, skipping", .{path});
+                continue;
+            }
 
             // TODO symlink following option
             const stat = std.os.fstatat(dir.fd, entry.name, std.os.AT_SYMLINK_NOFOLLOW) catch |e| {
