@@ -24,6 +24,9 @@
 //   For dirs:
 //     u64: dir_id
 //   (Yes, the difference between files and dirs is the size of the value)
+//   TODO: Splitting this up to have separate namespaces for dirs and files may
+//   simplify and improve performance for both the filesystem scanning code and
+//   the repo metadata writing.
 //
 // 2 + <u256: file_hash>
 //   u64: size
@@ -397,9 +400,9 @@ pub const DirIter = struct {
             .hashed => |f| {
                 var buf: [41]u8 = undefined;
                 buf[0] = 4;
-                buf[0..32].* = f.b3;
+                buf[1..33].* = f.b3;
                 buf[33..41].* = blake3.hashPiece(0, parent.slice()).root()[0..8].*;
-                _ = try self.t.del(buf[0..41]);
+                if(!try self.t.del(buf[0..41])) unreachable;
 
                 // Eagerly delete metadata associated with this blake3 hash if we don't have any other paths with the same hash.
                 var it = self.t.hashPathIter(f.b3);

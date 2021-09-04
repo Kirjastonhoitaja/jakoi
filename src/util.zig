@@ -132,3 +132,17 @@ test "pathTail" {
     try eqs("bar/etc", pathTail("foo/bar/etc"));
     try eqs("bar", pathTail("/foo/bar"));
 }
+
+
+// We don't accept everything as file names.
+pub fn isValidFileName(n: []const u8) bool {
+    for (n) |c| switch (c) {
+        '/', '\\', 0...0x1f, 0x7f => return false,
+        else => {},
+    };
+    return n.len > 0
+        and n.len < 256
+        and !(n.len == 1 and n[0] == '.')
+        and !(n.len == 2 and n[0] == '.' and n[1] == '.')
+        and std.unicode.utf8ValidateSlice(n);
+}

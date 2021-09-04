@@ -30,31 +30,34 @@ fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.D
 
 // Dirlist format: CBOR, with the following structure:
 //
-//   directory  = [ listing, directory, ... ] -- listing followed by subdirectories
-//   listing    = [ file_entry||dir_entry, ... ] -- entries are ordered by name
-//   file_entry = { 0: name, 1: size, 2: b3 }
-//   dir_entry  = { 0: name }
-//   name       = utf-8 string
-//   size       = file size as a positive integer
-//   b3         = blake3 root hash encoded as a 32-length byte string
+//   directory    = [ subdir_names, files, subdirs ]
+//   surdir_names = [ name, .. ]        -- names of subdirectories, ordered by strcmp()
+//   files        = [ file, .. ]        -- file entries, ordered by strcmp(name)
+//   subdirs      = [ directory, .. ]   -- contents of each subdirectory, same order as subdir_names
+//   file         = { 0: name, 1: size, 2: b3 }
+//   name         = utf-8 string
+//   size         = file size as a positive integer
+//   b3           = blake3 root hash encoded as a 32-length byte string
 //
 // One advantage of this dirlist format is that it can be used to synchronize
-// either a single directory listing, a recursive subdirectory or the full
-// repository. The first two require an additional lookup table to quickly get
-// to the right byte offsets, but that should be fairly cheap.
+// either a single directory listing ('subdir_names' + 'files'), a recursive
+// subdirectory ('directory') or the full repository (top-level 'directory').
+// The first two require an additional lookup table to quickly get to the right
+// byte offsets, but that should be fairly cheap.
 //
 // Another advantage is that, with said lookup table, this dirlist can be used
 // directly as the backend store of a browser interface. Downside is that the
 // order of listed files would have to be the same as they are in the dirlist
 // (for large dirs, at least, because a sort would be too expensive or because
-// the full list may not have been fetched yet). The current order is not very
-// user friendly.  Should the protocol define a more user-friendly order, and
-// what would that look like? Dirs before files + case-insensitive file name
-// order? We don't really want full unicode collation, as that is locale
-// dependent and not stable between Unicode versions. But then you get into the
-// whole MySQL utf8mb4_general_ci vs. _unicode_ci vs. _0900_ai_ci situation. :(
+// the full list may not have been fetched yet). The current order is not super
+// user friendly, but at least it does order dirs before files. Should the
+// protocol define a more user-friendly order, and what would that look like?
+// Case-insensitive file name order? We don't really want full unicode
+// collation, as that is locale dependent and not stable between Unicode
+// versions. But then you get into the whole MySQL utf8mb4_general_ci vs.
+// _unicode_ci vs. _0900_ai_ci situation. :(
 //
-// This format is totally not final, this is just an initial attempt. Things to
+// This format is totally not final, it's just an initial attempt. Things to
 // figure out:
 // - Additional file metadata. Current idea: add a metadata hash to file
 //   entries for which additional metadata is available. 128bits should provide
@@ -76,15 +79,6 @@ fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.D
 //   - Requires more network round-trips.
 //   So I'll be sticking with the current approach until I have benchmarks
 //   showing that O(n) sync is really too slow.
-// - Walking through the dirlist tree requires either keeping a queue of dirs
-//   or a queue of iterators at every level. The former may take quite a bit of
-//   memory, the latter will result in non-sequential reads and double-parsing
-//   all listings. The iterator approach can be made more efficient by sorting
-//   dirs before files. This entire problem can be solved by inlining the
-//   contents of a dir into the listing, but that would make it impossible to
-//   efficiently read a single directory listing. Another solution is to
-//   duplicate the dir name before writing out each subdir - turn that listing
-//   into a map?
 fn writeDirList(t: db.Txn, obj_dir: std.fs.Dir) !MetaFile {
     var fd = try obj_dir.createFileZ(".tmp-dirlist", .{.read=true});
     defer fd.close();
@@ -102,16 +96,21 @@ fn writeDirList(t: db.Txn, obj_dir: std.fs.Dir) !MetaFile {
 fn writeDirListDir(t: db.Txn, dir_id: u64, wr: anytype) (std.fs.File.WriteError || db.MdbError)!void {
     var it = t.dirIter(dir_id);
     defer it.deinit();
-
     try wr.writeArray(null);
+
     try wr.writeArray(null);
     while (try it.next()) |ent| {
         switch (ent.val()) {
-            .dir => {
-                try wr.writeMap(1);
-                try wr.writePos(0);
-                try wr.writeStr(ent.name());
-            },
+            .dir => try wr.writeStr(ent.name()),
+            else => {},
+        }
+    }
+    try wr.writeBreak();
+
+    try wr.writeArray(null);
+    try it.reset();
+    while (try it.next()) |ent| {
+        switch (ent.val()) {
             .hashed => |h| {
                 try wr.writeMap(3);
                 try wr.writePos(0);
@@ -121,11 +120,12 @@ fn writeDirListDir(t: db.Txn, dir_id: u64, wr: anytype) (std.fs.File.WriteError 
                 try wr.writePos(2);
                 try wr.writeBytes(&h.b3);
             },
-            .unhashed => {},
+            else => {},
         }
     }
     try wr.writeBreak();
 
+    try wr.writeArray(null);
     try it.reset();
     while (try it.next()) |ent| {
         switch (ent.val()) {
@@ -133,6 +133,8 @@ fn writeDirListDir(t: db.Txn, dir_id: u64, wr: anytype) (std.fs.File.WriteError 
             else => {},
         }
     }
+    try wr.writeBreak();
+
     try wr.writeBreak();
 }
 
