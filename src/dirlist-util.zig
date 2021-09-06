@@ -139,7 +139,7 @@ pub fn main() !void {
     var fd = if (file) |f| try std.fs.cwd().openFile(f, .{}) else usage();
     defer fd.close();
     // TODO: Windows.
-    var map = try std.os.mmap(null, try fd.getEndPos(), std.os.PROT_READ, std.os.MAP_PRIVATE, fd.handle, 0);
+    var map = try std.os.mmap(null, try fd.getEndPos(), std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, 0);
     defer std.os.munmap(map);
     var stream = std.io.fixedBufferStream(@as([]const u8, map));
     list(0, &stream) catch |e| {

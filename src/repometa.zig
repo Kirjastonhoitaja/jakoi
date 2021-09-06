@@ -17,7 +17,7 @@ fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.D
     // contents, so we don't have to read back what we just wrote. But eh, my
     // blake3.zig can't do that. Could use the std implementation for that.
     const b3 = blk: {
-        var map = try std.os.mmap(null, size, std.os.PROT_READ, std.os.MAP_PRIVATE, fd.handle, 0);
+        var map = try std.os.mmap(null, size, std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, 0);
         defer std.os.munmap(map);
         break :blk blake3.hashPiece(0, map).root();
     };
@@ -179,11 +179,8 @@ fn storeMetaFiles(t: db.Txn, dirlist: MetaFile, hashlist: ?MetaFile) !OldFiles {
 }
 
 pub fn write() !void {
-    var path = util.Path{};
-    try path.push(config.store_dir);
-    try path.push("obj");
-    try std.fs.cwd().makePath(path.slice());
-    var obj_dir = try std.fs.cwd().openDir(path.slice(), .{});
+    try config.store_dir.makePath("obj");
+    var obj_dir = try config.store_dir.openDir("obj", .{});
     defer obj_dir.close();
 
     const dirlist = try db.txn(.ro, writeDirList, .{ obj_dir });

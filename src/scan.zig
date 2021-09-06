@@ -59,12 +59,12 @@ const Listing = struct {
             }
 
             // TODO symlink following option
-            const stat = std.os.fstatat(dir.fd, entry.name, std.os.AT_SYMLINK_NOFOLLOW) catch |e| {
+            const stat = std.os.fstatat(dir.fd, entry.name, std.os.AT.SYMLINK_NOFOLLOW) catch |e| {
                 std.log.info("Unable to stat {}: {}, skipping", .{path, e});
                 continue;
             };
-            const isdir = std.os.system.S_ISDIR(stat.mode);
-            if (!isdir and !std.os.system.S_ISREG(stat.mode)) {
+            const isdir = std.os.system.S.ISDIR(stat.mode);
+            if (!isdir and !std.os.system.S.ISREG(stat.mode)) {
                 std.log.debug("Skipping non-regular file: {}", .{path});
                 continue;
             }
@@ -183,7 +183,8 @@ pub fn scan() !void {
             if (scanDir(e.id, stack.items[stack.items.len-1].dir, &path, e.name)) |q|
                 try stack.append(q)
             else |err|
-                std.log.info("Error reading {}: {}, skipping.", .{ path, err });
+                std.log.info("Error reading {}{s}{s}: {}, skipping.",
+                    .{ path, @as([]const u8, if (path.len > 0) "/" else ""), e.name, err });
         } else {
             path.pop();
             stack.pop().deinit();
@@ -222,10 +223,10 @@ fn hashFile(ent: db.hash_queue.Entry) !void {
     // TODO: Make this work on Windows.
     // TODO: Handle large files on 32bit systems.
     // TODO: Non-mmap fallback? Even fixing the above, mmap /is/ slightly fragile.
-    var map = try std.os.mmap(null, ent.size, std.os.PROT_READ, std.os.MAP_PRIVATE, fd.handle, 0);
+    var map = try std.os.mmap(null, ent.size, std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, 0);
     defer std.os.munmap(map);
 
-    const piece_size = config.min_piece_size;
+    const piece_size = config.blake3_piece_size;
     const num_pieces = std.math.divCeil(u64, ent.size, piece_size) catch unreachable;
     if (num_pieces == 1) {
         const b3 = blake3.hashPiece(0, map).root();

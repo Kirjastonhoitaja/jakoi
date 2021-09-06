@@ -7,6 +7,9 @@ pub const allocator = std.heap.c_allocator;
 
 // Convenient non-allocating path construction helper.
 // We simply don't support infinitely long paths.
+//
+// These utilities are intended for virtual paths exported by repositories, for
+// actual filesystem paths prefer using the functions in std.fs.path.
 pub const Path = struct {
     len: usize = 0,
     buf: [4096]u8 = undefined,
@@ -145,4 +148,22 @@ pub fn isValidFileName(n: []const u8) bool {
         and !(n.len == 1 and n[0] == '.')
         and !(n.len == 2 and n[0] == '.' and n[1] == '.')
         and std.unicode.utf8ValidateSlice(n);
+}
+
+
+// Run-time conversion between log levels and strings
+pub fn logLevelAsText(l: std.log.Level) []const u8 {
+    inline for (@typeInfo(@TypeOf(l)).Enum.fields) |f|
+        if (@enumToInt(l) == f.value)
+            return @intToEnum(@TypeOf(l), f.value).asText();
+    unreachable;
+}
+
+pub fn logLevelFromText(s: []const u8) ?std.log.Level {
+    inline for (@typeInfo(std.log.Level).Enum.fields) |f| {
+        const l = @intToEnum(std.log.Level, f.value);
+        if (std.ascii.eqlIgnoreCase(s, l.asText()) or std.ascii.eqlIgnoreCase(s, f.name))
+            return l;
+    }
+    return null;
 }

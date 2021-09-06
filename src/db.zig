@@ -602,10 +602,9 @@ fn openDb(t: Txn) !void {
 }
 
 pub fn open() !void {
-    var path = util.Path{};
-    try path.push(config.store_dir);
-    try path.push("db");
-    try std.fs.cwd().makePath(path.slice());
+    try config.store_dir.makePath("db");
+    var path = try std.fs.path.join(util.allocator, &.{config.store_path, "db"});
+    defer util.allocator.free(path);
 
     try rcErr(c.mdb_env_create(&db_env));
     errdefer c.mdb_env_close(db_env);
@@ -623,7 +622,7 @@ pub fn open() !void {
     // that kind of durability and it completely kills performance of small
     // transactions, which we need in order to handle dynamic map resizes.
     // Maybe add a config option for improved durability on unreliable devices?
-    try rcErr(c.mdb_env_open(db_env, path.slice().ptr, c.MDB_NOSYNC, 0o600));
+    try rcErr(c.mdb_env_open(db_env, path.ptr, c.MDB_NOSYNC, 0o600));
 
     return txn(.rw, openDb, .{});
 }
