@@ -6,6 +6,7 @@ const db = @import("db.zig");
 const scan = @import("scan.zig");
 const config = @import("config.zig");
 const util = @import("util.zig");
+const tor = @import("tor.zig");
 const repometa = @import("repometa.zig");
 
 pub const log_level: std.log.Level = .debug;
@@ -14,7 +15,7 @@ pub fn log(comptime level: std.log.Level, comptime scope: @Type(.EnumLiteral), c
     _ = scope;
     var l = log_impl.lock.acquire();
     defer l.release();
-    log_impl.write(level, std.fmt.bufPrint(&log_impl.logbuf, format, args) catch return);
+    log_impl.write(level, std.fmt.bufPrint(&log_impl.logbuf, format, args) catch &log_impl.logbuf);
 }
 
 const log_impl = struct {
@@ -98,6 +99,12 @@ pub fn main() anyerror!void {
     try scan.scan();
     try scan.hash();
     try repometa.write();
+
+    var torctl = tor.Control.connect() catch |e| {
+        std.log.crit("Unable to connect to the Tor control socket: {}", .{ e });
+        std.process.exit(0);
+    };
+    try torctl.setupOnion(1234, 4532);
 }
 
 

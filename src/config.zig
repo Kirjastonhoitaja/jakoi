@@ -11,6 +11,11 @@ pub var hash_threads: usize = 4;
 pub var blake3_piece_size: u64 = 1024*1024;
 pub var log_level: std.log.Level = .info;
 
+// Assumption: Tor is running on localhost, so the address must be localhost or a UNIX path.
+// TODO: Spawn/embed our own Tor instance, so we can set it up properly.
+pub var tor_control_address = std.net.Address.initIp4(.{127,0,0,1}, 9051);
+pub var tor_control_password: []const u8 = "0tqTCwh8ziHQGoBs8f6O"; // HASHEDPASSWORD authentication
+
 // TODO: Support multiple public dirs, mount-style.
 pub var public_dir = "zig-cache";
 
