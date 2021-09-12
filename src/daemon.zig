@@ -107,8 +107,9 @@ pub fn run() !void {
     thread.setName("Daemon server") catch {};
     thread.detach();
 
-    while (true) {
-        if (config.published_dirs.count() > 0) {
+    // Timer should be configurable
+    while (true) : (std.time.sleep(std.time.ns_per_hour)) {
+        if (!config.mounts.isEmpty()) {
             repo.start() catch |e| {
                 std.log.warn("Error starting repository server: {}", .{ e });
                 continue;
@@ -119,11 +120,8 @@ pub fn run() !void {
             try repometa.write();
 
         } else {
-            repo.stop() catch |e| {
+            repo.stop() catch |e|
                 std.log.warn("Error stopping repository server: {}", .{ e });
-                continue;
-            };
         }
-        std.time.sleep(std.time.ns_per_hour); // should be configurable
     }
 }

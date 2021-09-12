@@ -13,7 +13,6 @@ const DirQueue = struct {
     lst: std.ArrayList(Entry) = std.ArrayList(Entry).init(util.allocator),
     names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(util.allocator),
     idx: usize = 0,
-    dir: std.fs.Dir,
 
     const Entry = struct { name: []const u8, id: u64 = 0 };
 
@@ -29,12 +28,11 @@ const DirQueue = struct {
     fn deinit(s: *@This()) void {
         s.lst.deinit();
         s.names.deinit();
-        s.dir.close();
     }
 };
 
 const Listing = struct {
-    dirs: DirQueue,
+    dirs: DirQueue = .{},
     files: std.ArrayList(File) = std.ArrayList(File).init(util.allocator),
     names: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(util.allocator),
 
@@ -44,46 +42,71 @@ const Listing = struct {
         return std.mem.lessThan(u8, a.name, b.name);
     }
 
-    fn get(dir: std.fs.Dir, path: *util.Path) !Listing {
-        var l = Listing{ .dirs = .{ .dir = dir }};
-        errdefer l.deinit();
+    // TODO windows
+    fn add(self: *Listing, virtual: *const util.Path, parent: std.fs.Dir, fs: ?[]const u8) error{OutOfMemory}!?bool {
+        const name = std.fs.path.basenamePosix(virtual.slice());
 
+        // TODO symlink following option
+        const stat = (
+            if (fs) |p| std.os.fstatat(parent.fd, p, 0)
+            else std.os.fstatat(parent.fd, name, std.os.AT.SYMLINK_NOFOLLOW)
+        ) catch |e| {
+            if (fs == null) std.log.info("Unable to stat {}: {}, skipping", .{virtual, e})
+            else std.log.warn("Unable to stat published path '{}': {}", .{virtual, e});
+            return null;
+        };
+        const isdir = std.os.system.S.ISDIR(stat.mode);
+        if (!isdir and !std.os.system.S.ISREG(stat.mode)) {
+            if (fs == null) std.log.debug("Skipping non-regular file: {}", .{virtual})
+            else std.log.warn("Published path '{}' is neither a file nor a directory", .{virtual});
+            return null;
+        }
+        if (isdir)
+            try self.dirs.lst.append(.{ .name = try self.dirs.names.allocator.dupe(u8, name) })
+        else {
+            const mtime = stat.mtime().tv_sec;
+            try self.files.append(.{
+                .name = try self.names.allocator.dupe(u8, name),
+                .lastmod = if (mtime < 0) 0 else @intCast(u64, mtime),
+                .size = @intCast(u64, stat.size),
+            });
+        }
+        return isdir;
+    }
+
+    fn addFs(self: *Listing, dir: std.fs.Dir, mounts: *const config.Mounts, path: *util.Path) !void {
         var it = dir.iterate();
         while (try it.next()) |entry| {
             try path.push(entry.name);
             defer path.pop();
+
+            if (mounts.sub.contains(entry.name)) {
+                std.log.info("Virtual path '{}' also exists on the filesystem, ignoring filesystem entry", .{path});
+                continue;
+            }
 
             if (!util.isValidFileName(entry.name)) {
                 std.log.info("Invalid file name: {}, skipping", .{path});
                 continue;
             }
 
-            // TODO symlink following option
-            const stat = std.os.fstatat(dir.fd, entry.name, std.os.AT.SYMLINK_NOFOLLOW) catch |e| {
-                std.log.info("Unable to stat {}: {}, skipping", .{path, e});
-                continue;
-            };
-            const isdir = std.os.system.S.ISDIR(stat.mode);
-            if (!isdir and !std.os.system.S.ISREG(stat.mode)) {
-                std.log.debug("Skipping non-regular file: {}", .{path});
-                continue;
-            }
-            if (isdir) {
-                const name = try l.dirs.names.allocator.dupe(u8, entry.name);
-                try l.dirs.lst.append(.{ .name = name });
-            } else {
-                const name = try l.names.allocator.dupe(u8, entry.name);
-                const mtime = stat.mtime().tv_sec;
-                try l.files.append(.{
-                    .name = name,
-                    .lastmod = if (isdir) std.math.maxInt(u64) else if (mtime < 0) 0 else @intCast(u64, mtime),
-                    .size = @intCast(u64, stat.size),
-                });
-            }
+            _ = try self.add(path, dir, null);
         }
-        std.sort.sort(DirQueue.Entry, l.dirs.lst.items, @as(void, undefined), DirQueue.lessThan);
-        std.sort.sort(File, l.files.items, @as(void, undefined), lessThan);
-        return l;
+    }
+
+    fn addMounts(self: *Listing, mounts: *const config.Mounts, path: *util.Path) !void {
+        var it = mounts.sub.iterator();
+        while (it.next()) |entry| {
+            try path.push(entry.key_ptr.*);
+            defer path.pop();
+
+            if (entry.value_ptr.*.fs) |fs| {
+                const isdir = (try self.add(path, std.fs.cwd(), fs)) orelse false;
+                if (!isdir and entry.value_ptr.*.sub.count() > 0)
+                    std.log.warn("Published path '{}' points to a file, but there are other published paths beneath it. Those sub-paths will not be published.", .{path});
+            } else
+                try self.dirs.lst.append(.{ .name = try self.dirs.names.allocator.dupe(u8, entry.key_ptr.*) });
+        }
     }
 
     fn deinit(s: *@This()) void {
@@ -157,18 +180,30 @@ fn storeListing(t: db.Txn, id: u64, lst: *Listing, path: *util.Path) !void {
         try iter.addFile(files[fileIdx].name, files[fileIdx].lastmod, files[fileIdx].size);
 }
 
-fn scanDir(id: u64, parent: ?std.fs.Dir, path: *util.Path, name: []const u8) !DirQueue {
-    if (parent != null) try path.push(name);
-    errdefer if (parent != null) path.pop();
-    var dir = try (parent orelse std.fs.cwd()).openDir(name, .{.iterate=true});
+// Pushes the given name to 'path' on success
+fn scanDir(id: u64, path: *util.Path, name: []const u8) !DirQueue {
+    try path.push(name);
+    errdefer path.pop();
 
-    var lst = try Listing.get(dir, path);
-    errdefer lst.deinit();
-    try db.txn(.rw, storeListing, .{id, &lst, path});
+    var l = Listing{};
+    errdefer l.deinit();
 
-    lst.files.deinit();
-    lst.names.deinit();
-    return lst.dirs;
+    var sub = config.mounts.subdir(path.slice());
+    if (sub) |s| try l.addMounts(s, path);
+    if (try config.mounts.virtualToFs(path.slice())) |fs| {
+        defer util.allocator.free(fs);
+        var dir = try std.fs.cwd().openDir(fs, .{.iterate=true});
+        defer dir.close();
+        try l.addFs(dir, sub orelse &.{}, path);
+    }
+
+    std.sort.sort(DirQueue.Entry, l.dirs.lst.items, @as(void, undefined), DirQueue.lessThan);
+    std.sort.sort(Listing.File, l.files.items, @as(void, undefined), Listing.lessThan);
+    try db.txn(.rw, storeListing, .{id, &l, path});
+
+    l.files.deinit();
+    l.names.deinit();
+    return l.dirs;
 }
 
 pub fn scan() !void {
@@ -176,11 +211,10 @@ pub fn scan() !void {
     defer stack.deinit();
 
     var path = util.Path{};
-
-    try stack.append(try scanDir(0, null, &path, config.published_dirs.get("").?));
+    try stack.append(try scanDir(0, &path, ""));
     while (stack.items.len > 0) {
         if (stack.items[stack.items.len-1].next()) |e| {
-            if (scanDir(e.id, stack.items[stack.items.len-1].dir, &path, e.name)) |q|
+            if (scanDir(e.id, &path, e.name)) |q|
                 try stack.append(q)
             else |err|
                 std.log.info("Error reading {}{s}{s}: {}, skipping.",
@@ -214,8 +248,9 @@ fn hashFile(ent: db.hash_queue.Entry) !void {
     if (ent.size == 0)
         return db.txn(.rw, hashStore, .{ ent, blake3.hashPiece(0, "").root(), null });
 
-    var fspath = try config.virtualToFs(ent.path);
-    var fd = try std.fs.cwd().openFileZ(try fspath.sliceZ(), .{});
+    var fspath = (try config.mounts.virtualToFs(ent.path)) orelse unreachable;
+    defer util.allocator.free(fspath);
+    var fd = try std.fs.cwd().openFileZ(fspath, .{});
     defer fd.close();
 
     // TODO: Validate if ent.size is still correct.

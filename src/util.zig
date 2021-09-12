@@ -150,6 +150,14 @@ pub fn isValidFileName(n: []const u8) bool {
         and std.unicode.utf8ValidateSlice(n);
 }
 
+pub fn isValidPath(p_: []const u8) bool {
+    var p = p_;
+    while (p.len > 0) : (p = pathTail(p))
+        if (!isValidFileName(pathHead(p)))
+            return false;
+    return true;
+}
+
 
 // Run-time conversion between log levels and strings
 pub fn logLevelAsText(l: std.log.Level) []const u8 {

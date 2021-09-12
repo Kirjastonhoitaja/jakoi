@@ -603,7 +603,7 @@ fn openDb(t: Txn) !void {
 
 pub fn open() !void {
     try config.store_dir.makePath("db");
-    var path = try std.fs.path.join(util.allocator, &.{config.store_path, "db"});
+    var path = try std.fs.path.joinZ(util.allocator, &.{config.store_path, "db"});
     defer util.allocator.free(path);
 
     try rcErr(c.mdb_env_create(&db_env));

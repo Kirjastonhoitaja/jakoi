@@ -18,21 +18,22 @@ pub var log_level: std.log.Level = .info; // may be accessed before initConfig()
 pub var tor_control_address = std.net.Address.initIp4(.{127,0,0,1}, 9051);
 pub var tor_control_password: []const u8 = "0tqTCwh8ziHQGoBs8f6O"; // HASHEDPASSWORD authentication
 
-// Published directories, virtual mount point -> absolute filesystem path.
-// Assumption: Currently only holds at most a single directory mounted at the root.
-// actual multiple mount points should be implemented at some point.
-pub var published_dirs = std.StringHashMap([]const u8).init(util.allocator);
+pub var mounts = Mounts{};
 
 
 const ConfigFile = struct {
     hash_threads: ?usize = null,
     blake3_piece_size: ?u64 = null,
     log_level: ?[]const u8 = null,
-    published_dirs: ?[]PublishedDir = null,
+    published_paths: ?[]PublishedPath = null,
 
-    const PublishedDir = struct {
+    const PublishedPath = struct {
         virtual: []const u8,
         fs: []const u8,
+
+        fn lessThan(_: void, a: PublishedPath, b: PublishedPath) bool {
+            return std.mem.lessThan(u8, a.virtual, b.virtual);
+        }
     };
 
     const opts = std.json.ParseOptions{
@@ -51,25 +52,36 @@ const ConfigFile = struct {
         blake3_piece_size = self.blake3_piece_size orelse defaults.blake3_piece_size.?;
         log_level = util.logLevelFromText(self.log_level orelse defaults.log_level.?).?;
 
-        // TODO: Proper merging so that we can update the existing database on change
-        published_dirs.clearRetainingCapacity(); // This leaks memory.
-        for (self.published_dirs orelse &[0]PublishedDir{}) |dir| try published_dirs.put(
-            try util.allocator.dupe(u8, dir.virtual),
-            try util.allocator.dupe(u8, dir.fs)
-        );
+        mounts.deinit();
+        mounts = try Mounts.fromConfig(self.published_paths orelse &.{});
+    }
+
+    fn verify(self: *ConfigFile) !void {
+        if (self.log_level) |v| _ = util.logLevelFromText(v) orelse return error.InvalidLogLevel;
+        if (self.blake3_piece_size) |v| if (v < 1024 or !std.math.isPowerOfTwo(v)) return error.InvalidBlake3PieceSize;
+
+        if (self.published_paths) |p| {
+            for (p) |e| {
+                if (!util.isValidPath(e.virtual)) return error.InvalidMountPath;
+                if (!std.fs.path.isAbsolute(e.fs)) return error.InvalidRelativeMountPath;
+            }
+            std.sort.sort(PublishedPath, p, @as(void, undefined), PublishedPath.lessThan);
+            if (p.len > 1) {
+                var last_virt = p[0].virtual;
+                for (p[1..]) |e| {
+                    if (std.mem.eql(u8, last_virt, e.virtual))
+                        return error.DuplicateMountPoint;
+                    last_virt = e.virtual;
+                }
+            }
+        }
     }
 
     fn read() !ConfigFile {
         var data = try store_dir.readFileAlloc(util.allocator, "config", 10*1024*1024);
         defer util.allocator.free(data);
-        const self = try std.json.parse(ConfigFile, &std.json.TokenStream.init(data), opts);
-
-        if (self.log_level) |v| _ = util.logLevelFromText(v) orelse return error.InvalidLogLevel;
-        if (self.blake3_piece_size) |v| if (v < 1024 or !std.math.isPowerOfTwo(v)) return error.InvalidBlake3PieceSize;
-        if (self.published_dirs) |v| {
-            if (v.len > 1) return error.MultipleDirsNotYetImplemented;
-            if (v.len == 1 and v[0].virtual.len != 0) return error.NonRootVirtualNotYetImplemented;
-        }
+        var self = try std.json.parse(ConfigFile, &std.json.TokenStream.init(data), opts);
+        try self.verify();
         return self;
     }
 
@@ -91,6 +103,113 @@ const ConfigFile = struct {
         std.json.parseFree(ConfigFile, self, opts);
     }
 };
+
+// Recursive HashMap tree representing published mount points
+pub const Mounts = struct {
+    sub: std.StringHashMap(Mounts) = std.StringHashMap(Mounts).init(util.allocator),
+    fs: ?[]const u8 = null,
+
+    fn fromConfig(conf: []const ConfigFile.PublishedPath) error{OutOfMemory}!Mounts {
+        var self = Mounts{};
+        for (conf) |dir| {
+            var virt = dir.virtual;
+            var parent = &self;
+            while (virt.len > 0) {
+                var ent = try parent.sub.getOrPut(util.pathHead(virt));
+                if (!ent.found_existing) {
+                    ent.key_ptr.* = try util.allocator.dupe(u8, util.pathHead(virt));
+                    ent.value_ptr.* = .{};
+                }
+                parent = &ent.value_ptr.*;
+                virt = util.pathTail(virt);
+            }
+            std.debug.assert(parent.fs == null);
+            parent.fs = try util.allocator.dupe(u8, dir.fs);
+        }
+        return self;
+    }
+
+    pub fn isEmpty(self: *const Mounts) bool {
+        return self.fs == null and self.sub.count() == 0;
+    }
+
+    pub fn virtualToFs(self: *const Mounts, vpath_: []const u8) error{OutOfMemory}!?[:0]u8 {
+        var fs = self.fs;
+        var vpath = std.mem.trim(u8, vpath_, "/");
+        var virt = vpath;
+        var parent = self;
+        while (vpath.len > 0) {
+            if (parent.sub.getPtr(util.pathHead(vpath))) |e| {
+                vpath = util.pathTail(vpath);
+                if (e.fs) |v| {
+                    fs = v;
+                    virt = vpath;
+                }
+                parent = e;
+            } else break;
+        }
+        if (fs) |p| return try std.fs.path.joinZ(util.allocator, &.{p, virt});
+        return null;
+    }
+
+    pub fn subdir(self: *const Mounts, vpath_: []const u8) ?*const Mounts {
+        var vpath = std.mem.trim(u8, vpath_, "/");
+        var ret = self;
+        while (vpath.len > 0) {
+            ret = ret.sub.getPtr(util.pathHead(vpath)) orelse return null;
+            vpath = util.pathTail(vpath);
+        }
+        return ret;
+    }
+
+    fn deinit(self: *Mounts) void {
+        if (self.fs) |p| util.allocator.free(p);
+        var it = self.sub.iterator();
+        while (it.next()) |e| {
+            util.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        self.sub.deinit();
+    }
+};
+
+
+// This test leaks memory. That's fiiiiiine.
+test "virtualToFs" {
+    const m = try Mounts.fromConfig(&.{
+        .{ .virtual = "foo", .fs = "/_foo_" },
+        .{ .virtual = "foo/bar", .fs = "/_bar_" },
+        .{ .virtual = "a/b/c", .fs = "/_abc_" },
+    });
+    const ex = std.testing.expect;
+    try ex(null == try m.virtualToFs(""));
+    try ex(null == try m.virtualToFs("a"));
+    try ex(null == try m.virtualToFs("a/b"));
+    try ex(null == try m.virtualToFs("a/b/d"));
+    try ex(null == try m.virtualToFs("unknownpath"));
+
+    const eqs = std.testing.expectEqualStrings;
+    const sep = std.fs.path.sep_str;
+    try eqs("/_foo_", (try m.virtualToFs("foo")).?);
+    try eqs("/_foo_", (try m.virtualToFs("foo/")).?);
+    try eqs("/_foo_", (try m.virtualToFs("//foo///")).?);
+    try eqs("/_foo_" ++ sep ++ "rest", (try m.virtualToFs("foo/rest")).?);
+    try eqs("/_bar_", (try m.virtualToFs("foo/bar")).?);
+    try eqs("/_bar_" ++ sep ++ "rest", (try m.virtualToFs("foo/bar/rest")).?);
+    try eqs("/_abc_", (try m.virtualToFs("/a/b/c")).?);
+    try eqs("/_abc_" ++ sep ++ "rest", (try m.virtualToFs("/a/b/c/rest")).?);
+
+    // Has a root, so never returns null
+    const r = try Mounts.fromConfig(&.{
+        .{ .virtual = "", .fs = "/_root_" },
+        .{ .virtual = "foo", .fs = "/_foo_" },
+    });
+    try eqs("/_root_", (try r.virtualToFs("")).?);
+    try eqs("/_root_", (try r.virtualToFs("/")).?);
+    try eqs("/_root_" ++ sep ++ "rest", (try r.virtualToFs("rest")).?);
+    try eqs("/_foo_", (try r.virtualToFs("foo")).?);
+    try eqs("/_foo_" ++ sep ++ "rest", (try r.virtualToFs("foo/rest")).?);
+}
 
 
 // Uses XDG_CONFIG_HOME by default, but that's not /quite/ ideal since the
@@ -141,13 +260,4 @@ pub fn initConfig() !void {
     };
     defer conf.deinit();
     try conf.apply();
-}
-
-
-pub fn virtualToFs(vpath: []const u8) !util.Path {
-    std.debug.assert(published_dirs.count() > 0);
-    var p = util.Path{};
-    try p.push(published_dirs.get("").?);
-    try p.push(vpath);
-    return p;
 }

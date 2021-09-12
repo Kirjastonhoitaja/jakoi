@@ -218,6 +218,7 @@ pub fn main() anyerror!void {
 
 
 test "" {
+    _ = config;
     _ = @import("blake3.zig");
     _ = @import("util.zig");
     _ = @import("cbor.zig");
