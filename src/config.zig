@@ -7,82 +7,90 @@ const util = @import("util.zig");
 pub var store_path: []const u8 = "";
 pub var store_dir = std.fs.cwd();
 
-pub var hash_threads: usize = 4;
-pub var blake3_piece_size: u64 = 1024*1024;
-pub var log_level: std.log.Level = .info;
+// Run-time configuration, defaults are set in ConfigFile.defaults and
+// initialized by initConfig().
+pub var hash_threads: ?usize = undefined;
+pub var blake3_piece_size: u64 = undefined;
+pub var log_level: std.log.Level = .info; // may be accessed before initConfig()
 
 // Assumption: Tor is running on localhost, so the address must be localhost or a UNIX path.
 // TODO: Spawn/embed our own Tor instance, so we can set it up properly.
 pub var tor_control_address = std.net.Address.initIp4(.{127,0,0,1}, 9051);
 pub var tor_control_password: []const u8 = "0tqTCwh8ziHQGoBs8f6O"; // HASHEDPASSWORD authentication
 
-// TODO: Support multiple public dirs, mount-style.
-pub var public_dir = "zig-cache";
+// Published directories, virtual mount point -> absolute filesystem path.
+// Assumption: Currently only holds at most a single directory mounted at the root.
+// actual multiple mount points should be implemented at some point.
+pub var published_dirs = std.StringHashMap([]const u8).init(util.allocator);
 
 
-pub const ConfigReader = struct {
-    rd: std.io.BufferedReader(4096, std.fs.File.Reader),
-    linenum: u32 = 0,
-    linebuf: [4096]u8 = undefined,
+const ConfigFile = struct {
+    hash_threads: ?usize = null,
+    blake3_piece_size: ?u64 = null,
+    log_level: ?[]const u8 = null,
+    published_dirs: ?[]PublishedDir = null,
 
-    const Self = @This();
-
-    const Line = struct {
-        line: []const u8,
-        key: []const u8,
-        val: []const u8,
+    const PublishedDir = struct {
+        virtual: []const u8,
+        fs: []const u8,
     };
 
-    fn readLine(self: *Self) !?Line {
-        const line_raw = (try self.rd.reader().readUntilDelimiterOrEof(&self.linebuf, '\n')) orelse return null;
-        self.linenum += 1;
-        const line = std.mem.trim(u8, line_raw, &std.ascii.spaces);
-        if (line.len == 0 or line[0] == '#') return Line{.line = line, .key = "", .val = ""};
-        const off = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidStatement;
-        return Line{
-            .line = line,
-            .key = line[0..off],
-            .val = std.mem.trimLeft(u8, line[off..], &std.ascii.spaces),
-        };
+    const opts = std.json.ParseOptions{
+        .allocator = util.allocator,
+        .ignore_unknown_fields = true,
+    };
+
+    // Do NOT call .deinit() on this one!
+    const defaults = ConfigFile{
+        .blake3_piece_size = 1024*1024,
+        .log_level = "info",
+    };
+
+    fn apply(self: *const ConfigFile) !void {
+        hash_threads = self.hash_threads orelse defaults.hash_threads;
+        blake3_piece_size = self.blake3_piece_size orelse defaults.blake3_piece_size.?;
+        log_level = util.logLevelFromText(self.log_level orelse defaults.log_level.?).?;
+
+        // TODO: Proper merging so that we can update the existing database on change
+        published_dirs.clearRetainingCapacity(); // This leaks memory.
+        for (self.published_dirs orelse &[0]PublishedDir{}) |dir| try published_dirs.put(
+            try util.allocator.dupe(u8, dir.virtual),
+            try util.allocator.dupe(u8, dir.fs)
+        );
     }
 
-    pub fn read(error_line: *?u32) !void {
-        var file = try store_dir.openFile("config", .{});
-        defer file.close();
-        var self = Self{.rd = std.io.bufferedReader(file.reader())};
-        errdefer error_line.* = self.linenum;
-        while (try self.readLine()) |line| {
-            if (line.key.len == 0) continue;
-            const eql = std.mem.eql;
-            if (eql(u8, line.key, "blake3_piece_size"))
-                blake3_piece_size = try std.fmt.parseUnsigned(u64, line.val, 10)
-            else if (eql(u8, line.key, "hash_threads"))
-                hash_threads = try std.fmt.parseUnsigned(usize, line.val, 10)
-            else if (eql(u8, line.key, "log_level"))
-                log_level = util.logLevelFromText(line.val) orelse return error.InvalidLogLevel
-            else
-                return error.UnknownVariable;
+    fn read() !ConfigFile {
+        var data = try store_dir.readFileAlloc(util.allocator, "config", 10*1024*1024);
+        defer util.allocator.free(data);
+        const self = try std.json.parse(ConfigFile, &std.json.TokenStream.init(data), opts);
+
+        if (self.log_level) |v| _ = util.logLevelFromText(v) orelse return error.InvalidLogLevel;
+        if (self.blake3_piece_size) |v| if (v < 1024 or !std.math.isPowerOfTwo(v)) return error.InvalidBlake3PieceSize;
+        if (self.published_dirs) |v| {
+            if (v.len > 1) return error.MultipleDirsNotYetImplemented;
+            if (v.len == 1 and v[0].virtual.len != 0) return error.NonRootVirtualNotYetImplemented;
         }
+        return self;
+    }
+
+    fn write(self: *ConfigFile) !void {
+        {
+            var file = try store_dir.createFile("config~", .{});
+            defer file.close();
+            errdefer store_dir.deleteFile("config~") catch {};
+
+            var buf = std.io.bufferedWriter(file.writer());
+            try std.json.stringify(self, .{ .whitespace = .{} }, buf.writer());
+            try buf.writer().writeByte('\n');
+            try buf.flush();
+        }
+        try store_dir.rename("config~", "config");
+    }
+
+    fn deinit(self: ConfigFile) void {
+        std.json.parseFree(ConfigFile, self, opts);
     }
 };
-
-
-fn writeConfig() !void {
-    // TODO: use ConfigReader to preserve empty lines, comments and order of statements.
-    {
-        var file = try store_dir.createFile("config~", .{});
-        defer file.close();
-        errdefer store_dir.deleteFile("config~") catch {};
-
-        var buf = std.io.bufferedWriter(file.writer());
-        var wr = buf.writer();
-        try wr.print("hash_threads {}\n", .{ hash_threads });
-        try wr.print("blake3_piece_size {}\n", .{ blake3_piece_size });
-        try wr.print("log_level {s}\n", .{ util.logLevelAsText(log_level) });
-        try buf.flush();
-    }
-    try store_dir.rename("config~", "config");
-}
 
 
 // Uses XDG_CONFIG_HOME by default, but that's not /quite/ ideal since the
@@ -92,8 +100,9 @@ fn writeConfig() !void {
 // re-hashing. The caches and runtime stuff could be moved elsewhere, but I do
 // sort-of like having everything together, helps with portability and managing
 // multiple stores.
-pub fn initStore() !void {
+pub fn initStore(allow_init: bool, cli_path: ?[]const u8) !void {
     store_path = blk: {
+        if (cli_path) |p| break :blk p;
         if (std.process.getEnvVarOwned(util.allocator, "JAKOI_STORE")) |p| break :blk p
         else |_| {}
 
@@ -108,31 +117,37 @@ pub fn initStore() !void {
         } else |_| return error.NoStorePath;
     };
 
+    // cli_path may be relative, but env vars must be absolute.
+    if (cli_path != null) {
+        if (allow_init) try std.fs.cwd().makePath(store_path);
+        store_path = try std.fs.cwd().realpathAlloc(util.allocator, store_path);
+    }
     if (!std.fs.path.isAbsolute(store_path)) return error.RelativeStorePath;
 
     if (std.fs.accessAbsolute(store_path, .{}))
         std.log.info("Using store path: {s}", .{store_path})
-    else |_| {
+    else |_| if (allow_init) {
         std.log.notice("Initializing a fresh Jakoi setup at {s}", .{store_path});
         try std.fs.cwd().makePath(store_path);
-    }
+    } else return error.FileNotFound;
     store_dir = try std.fs.openDirAbsolute(store_path, .{});
 }
 
 
-pub fn initConfig(error_line: *?u32) !void {
-    hash_threads = std.math.min(4, std.Thread.getCpuCount() catch 1);
-
-    ConfigReader.read(error_line) catch |e| switch (e) {
-        error.FileNotFound => try writeConfig(),
+pub fn initConfig() !void {
+    var conf = ConfigFile.read() catch |e| switch (e) {
+        error.FileNotFound => ConfigFile{},
         else => return e,
     };
+    defer conf.deinit();
+    try conf.apply();
 }
 
 
 pub fn virtualToFs(vpath: []const u8) !util.Path {
+    std.debug.assert(published_dirs.count() > 0);
     var p = util.Path{};
-    try p.push(public_dir);
+    try p.push(published_dirs.get("").?);
     try p.push(vpath);
     return p;
 }

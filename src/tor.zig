@@ -105,7 +105,17 @@ pub const Control = struct {
         }
     }
 
-    pub fn connect() !Control {
+    pub fn removeOnion(self: *Self) !void {
+        var buf: [256]u8 = undefined;
+        const addr = try config.store_dir.readFile("onion-hostname", &buf);
+        try self.writeCmd("DEL_ONION {s}", .{ std.mem.sliceTo(addr, '.') });
+        var msg = try self.readResponse();
+        defer allocator.free(msg);
+        if (std.mem.startsWith(u8, msg, "552")) return error.UnknownOnionService;
+        if (!std.mem.startsWith(u8, msg, "250")) return error.UnexpectedResponse;
+    }
+
+    fn connect() !Control {
         const conn = try std.net.tcpConnectToAddress(config.tor_control_address);
         errdefer conn.close();
         var self = Control{
@@ -124,7 +134,23 @@ pub const Control = struct {
         return self;
     }
 
-    pub fn close(self: *Self) void {
+    fn close(self: *Self) void {
         self.conn.close();
     }
 };
+
+
+// Return a lazily-initialzed control connection to our Tor instance.
+// (Thread-safe, but the Control connection itself isn't, yet!)
+pub fn control() !*Control {
+    const c = struct {
+        var conn: ?*Control = null;
+        var mutex = std.Thread.Mutex{};
+    };
+    var l = c.mutex.acquire();
+    defer l.release();
+    if (c.conn) |r| return r;
+    c.conn = try allocator.create(Control);
+    c.conn.?.* = try Control.connect();
+    return c.conn.?;
+}

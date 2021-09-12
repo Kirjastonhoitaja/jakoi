@@ -177,7 +177,7 @@ pub fn scan() !void {
 
     var path = util.Path{};
 
-    try stack.append(try scanDir(0, null, &path, config.public_dir));
+    try stack.append(try scanDir(0, null, &path, config.published_dirs.get("").?));
     while (stack.items.len > 0) {
         if (stack.items[stack.items.len-1].next()) |e| {
             if (scanDir(e.id, stack.items[stack.items.len-1].dir, &path, e.name)) |q|
@@ -264,7 +264,8 @@ pub fn hash() !void {
     try db.txn(.ro, hashPopulate, .{});
     var threads = std.ArrayList(std.Thread).init(util.allocator);
     defer threads.deinit();
-    var i = config.hash_threads;
+    var i = config.hash_threads orelse std.math.min(4, std.Thread.getCpuCount() catch 1);
+
     while (i > 0) : (i -= 1) {
         // We do call a few recursive functions, but 1M should be more than enough.
         var t = try std.Thread.spawn(.{ .stack_size = 1024*1024 }, hashThread, .{});
