@@ -69,12 +69,6 @@ pub fn build(b: *std.build.Builder) void {
     linkStuff(&target, exe, opt);
     exe.install();
 
-    const dirlist = b.addExecutable("jakoi-dirlist", "src/dirlist-util.zig");
-    dirlist.setTarget(target);
-    dirlist.setBuildMode(mode);
-    dirlist.linkLibC();
-    dirlist.install();
-
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

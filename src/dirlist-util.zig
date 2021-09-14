@@ -12,11 +12,6 @@ const Stream = std.io.FixedBufferStream([]const u8);
 
 var quiet = false;
 
-fn usage() noreturn {
-    std.log.warn("Usage: jakoi-dirlist [-q] <file>", .{});
-    std.process.exit(1);
-}
-
 const ListError = error{
     InvalidDirList,
     DuplicateKey,
@@ -122,21 +117,9 @@ fn list(indent: usize, stream: *Stream) (std.os.WriteError || ListError)!void {
 }
 
 
-pub fn main() !void {
-    var file: ?[]const u8 = null;
-    var it = std.process.args();
-    _ = it.skip();
-    while (it.next(util.allocator)) |arge| {
-        var arg = try arge;
-        if (std.mem.eql(u8, arg, "-q")) quiet = true
-        else if (file == null) {
-            file = arg;
-            continue;
-        } else usage();
-        util.allocator.free(arg);
-    }
-
-    var fd = if (file) |f| try std.fs.cwd().openFile(f, .{}) else usage();
+pub fn run(quiet_: bool, file: []const u8) !void {
+    quiet = quiet_;
+    var fd = try std.fs.cwd().openFile(file, .{});
     defer fd.close();
     var map = try util.mapFile(fd, 0, try fd.getEndPos());
     defer util.unmapFile(map);

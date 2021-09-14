@@ -54,67 +54,77 @@ const log_impl = struct {
 
 
 const cli = struct {
+    var args: std.process.ArgIterator = undefined;
     var verbosity = std.log.Level.info;
     var allow_init = true;
     var store_path: ?[]const u8 = null;
-    var cmd = Cmd{ .help = .{} };
+    var cmd = Cmd.help;
 
-    const Cmd = union(enum) {
-        help: struct {
-            cmd: ?[]u8 = null,
-        },
-        daemon: struct {
-            background: bool = true,
-        },
-        refresh: void,
-        status: void,
-        config: struct {
-            key: ?[]const u8 = null,
-            value: ?[]const u8 = null,
-        },
-    };
+    // cmd-specific arguments.
+    // Should be in a tagged union, but that just keeps crashing the Zig compiler.
+    var help_cmd: ?Cmd = null;
+    var daemon_background: bool = true;
+    var dirlist_file: ?[]const u8 = null;
+
+    const Cmd = enum{ help, daemon, refresh, status, config, dirlist };
 
     const eql = std.mem.eql;
 
-    fn help(c: []u8) noreturn {
-        const txt = if (eql(u8, c, ""))
-            \\Usage: jakoi [-vqs] command [options]
-            \\
-            \\Global options:
-            \\  -v, --verbose       Be more verbose
-            \\  -q, --quiet         Be less verbose
-            \\  -s, --store <path>  Use the given store directory
-            \\
-            \\Commands:
-            \\  help       - Display help text
-            \\  daemon     - Spawn the background daemon
-            \\  refresh    - Initiate a filesystem refresh
-            \\  status     - Display status
-            \\  config     - Display or update configuration
-            else if (eql(u8, c, "help"))
-            \\Usage: jakoi help [command]
-            \\
-            \\Print usage information for the given command.
-            else if (eql(u8, c, "daemon"))
-            \\Usage: jakoi daemon [options]
-            \\
-            \\Spawn the background daemon.
-            \\
-            \\Options:
-            \\  --foreground    Run the daemon on the foreground
-            else if (eql(u8, c, "refresh"))
-            \\Usage: jakoi refresh
-            \\
-            \\Re-scan the filesystem and refresh repository metadata.
-            else if (eql(u8, c, "status"))
-            \\Usage: jakoi status
-            \\
-            \\Display status about your repository and file download queue.
-            else if (eql(u8, c, "config"))
-            \\Usage: jakoi config [key [value]]
-            \\
-            \\Get or set configuration variables.
-            else err("Unknown command: {s}\n", .{ c });
+    fn stringToCmd(s: []const u8) ?Cmd {
+        if (eql(u8, s, "-h") or eql(u8, s, "--help")) return Cmd.help;
+        return std.meta.stringToEnum(Cmd, s);
+    }
+
+    fn nextArg() ?[]u8 {
+        return if (args.next(util.allocator)) |v|
+            (v catch |e| err("Error reading CLI arguments: {}\n", .{e})) else null;
+    }
+
+    fn help(c: ?Cmd) noreturn {
+        const txt = if (c) |v| switch (v) {
+            .help =>
+                \\Usage: jakoi help [command]
+                \\
+                \\Print usage information for the given command.
+            , .daemon =>
+                \\Usage: jakoi daemon [options]
+                \\
+                \\Spawn the background daemon.
+                \\
+                \\Options:
+                \\  --foreground    Run the daemon on the foreground
+            , .refresh =>
+                \\Usage: jakoi refresh
+                \\
+                \\Re-scan the filesystem and refresh repository metadata.
+            , .status =>
+                \\Usage: jakoi status
+                \\
+                \\Display status about your repository and file download queue.
+            , .config =>
+                \\Usage: jakoi config [key [value]]
+                \\
+                \\Get or set configuration variables.
+            , .dirlist =>
+                \\Usage: jakoi dirlist <file>
+                \\
+                \\Dump the contents of a dirlist file.
+                \\Just a debugging/benchmarking command, you won't need this.
+            } else
+                \\Usage: jakoi [-vqs] command [options]
+                \\
+                \\Global options:
+                \\  -v, --verbose       Be more verbose
+                \\  -q, --quiet         Be less verbose
+                \\  -s, --store <path>  Use the given store directory
+                \\
+                \\Commands:
+                \\  help       - Display help text
+                \\  daemon     - Spawn the background daemon
+                \\  refresh    - Initiate a filesystem refresh
+                \\  status     - Display status
+                \\  config     - Display or update configuration
+            ;
         std.io.getStdOut().writer().print("{s}\n", .{ txt }) catch {};
         std.process.exit(0);
     }
@@ -124,46 +134,48 @@ const cli = struct {
         std.process.exit(1);
     }
 
-    fn parse() !void {
-        var it = std.process.args();
-        _ = it.skip();
-        while (it.next(util.allocator)) |opt_| {
-            var opt = try opt_;
+    fn parse() void {
+        args = std.process.args();
+        _ = args.skip();
+
+        // Global options
+        while (nextArg()) |opt| {
             defer util.allocator.free(opt);
-            if (eql(u8, opt, "help") or eql(u8, opt, "-h") or eql(u8, opt, "--help")) {
-                cmd = .{ .help = .{} };
-                break;
-            } else if (eql(u8, opt, "daemon")) {
-                cmd = .{ .daemon = .{} };
-                break;
-            } else if (eql(u8, opt, "refresh")) {
-                cmd = .{ .refresh = .{} };
-                break;
-            } else if (eql(u8, opt, "status")) {
-                cmd = .{ .status = .{} };
-                break;
-            } else if (eql(u8, opt, "config")) {
-                cmd = .{ .config = .{} };
-                break;
-            } else if (eql(u8, opt, "-v") or eql(u8, opt, "--verbose"))
+            if (stringToCmd(opt)) |c| { cmd = c; break; }
+            else if (eql(u8, opt, "-v") or eql(u8, opt, "--verbose"))
                 verbosity = .debug
             else if (eql(u8, opt, "-q") or eql(u8, opt, "--quiet"))
                 verbosity = .warn
             else if (eql(u8, opt, "-s") or eql(u8, opt, "--store"))
-                store_path = try (it.next(util.allocator) orelse err("Option {s} requires an argument.\n", .{ opt }))
+                store_path = nextArg() orelse err("Option {s} requires an argument.\n", .{ opt })
             else err("Unknown argument: {s}\n", .{ opt });
         }
 
+        // Cmd-specific options
         switch (cmd) {
-            .help => |*o| o.cmd = if (it.next(util.allocator)) |v| try v else null,
+            .help => {
+                if (nextArg()) |v|
+                    help_cmd = stringToCmd(v) orelse err("Unknown command: {s}\n", .{ v });
+            },
+            .daemon => {
+                if (nextArg()) |v| {
+                    if (eql(u8, v, "--foreground")) daemon_background = false
+                    else err("Unknown argument: {s}\n", .{ v });
+                }
+            },
+            .dirlist => dirlist_file = nextArg() orelse err("No file given.\n", .{}),
             else => {}
         }
-        if (it.next(util.allocator)) |v| err("Unknown argument: {s}\n", .{ try v });
+        if (nextArg()) |v| err("Unknown argument: {s}\n", .{ v });
 
         allow_init = switch (cmd) {
-            .help => |*o| help(o.cmd orelse ""),
+            .help => help(help_cmd),
+            .dirlist => {
+                @import("dirlist-util.zig").run(verbosity == .warn, dirlist_file.?) catch |e| err("{}\n", .{e});
+                std.process.exit(0);
+            },
             .daemon => true,
-            .config => true, // Should be: |*o| o.value != null,
+            .config => true, // Only when setting a value
             else => false,
         };
     }
@@ -176,7 +188,7 @@ pub fn main() anyerror!void {
     if (std.builtin.os.tag != .windows)
         _ = @cImport(@cInclude("sys/stat.h")).umask(0o077);
 
-    try cli.parse();
+    cli.parse();
 
     config.initStore(cli.allow_init, cli.store_path) catch |e| {
         switch (e) {
@@ -204,15 +216,18 @@ pub fn main() anyerror!void {
     if (config.store_dir.createFile("log", .{.truncate=false})) |f| log_impl.file = f
     else |e| std.log.warn("Unable to open log file: {}", .{e});
 
-    try db.open();
+    db.open() catch |e| {
+        std.log.crit("Unable to open database: {}", .{ e });
+        std.process.exit(0);
+    };
 
     switch (cli.cmd) {
-        .help => {},
         .daemon => {
-            //if (o.background) cli.err("Running in the background is not supported yet, use --foreground.", .{});
+            if (cli.daemon_background) cli.err("Running in the background is not supported yet, use --foreground.", .{});
             try daemon.run();
         },
         .status, .config, .refresh => cli.err("Not yet implemented.\n", .{}),
+        else => unreachable,
     }
 }
 
