@@ -5,7 +5,7 @@ const std = @import("std");
 const util = @import("util.zig");
 
 pub var store_path: []const u8 = "";
-pub var store_dir = std.fs.cwd();
+pub var store_dir: std.fs.Dir = undefined;
 
 // Run-time configuration, defaults are set in ConfigFile.defaults and
 // initialized by initConfig().
@@ -225,7 +225,13 @@ pub fn initStore(allow_init: bool, cli_path: ?[]const u8) !void {
         if (std.process.getEnvVarOwned(util.allocator, "JAKOI_STORE")) |p| break :blk p
         else |_| {}
 
-        if (std.builtin.os.tag == .windows) break :blk try std.fs.getAppDataDir("jakoi");
+        if (std.builtin.os.tag == .windows) {
+            if (std.fs.getAppDataDir(util.allocator, "jakoi")) |p| break :blk p
+            else |e| switch (e) {
+                error.AppDataDirUnavailable => return error.NoStorePath,
+                else => return e,
+            }
+        }
 
         if (std.process.getEnvVarOwned(util.allocator, "XDG_CONFIG_HOME")) |p| {
             defer util.allocator.free(p);

@@ -31,6 +31,42 @@ const DirQueue = struct {
     }
 };
 
+const MiniStat = struct {
+    isdir: bool,
+    isfile: bool,
+    mtime: u64,
+    size: u64,
+
+    fn stat(parent: std.fs.Dir, name: []const u8, follow_symlinks: bool) !MiniStat {
+        if (std.builtin.os.tag == .windows) {
+            // TODO: NtQueryDirectoryFile() is much faster and probably more
+            // appropriate here, but I'm not sure if/how that will affect a
+            // concurrent directory iterator on 'parent'.
+            var f = parent.openFile(name, .{}) catch |e| switch (e) {
+                error.IsDir => return MiniStat{ .isdir = true, .isfile = false, .mtime = 0, .size = 0 },
+                else => return e,
+            };
+            defer f.close();
+            const s = try f.stat();
+            return MiniStat{
+                .isdir = s.kind == .Directory,
+                .isfile = s.kind == .File,
+                .mtime = @intCast(u64, @divFloor(s.mtime, std.time.ns_per_s)),
+                .size = s.size,
+            };
+        } else {
+            const s = try std.os.fstatat(parent.fd, name, if (follow_symlinks) 0 else std.os.AT.SYMLINK_NOFOLLOW);
+            const mtime = s.mtime().tv_sec;
+            return MiniStat{
+                .isdir = std.os.system.S.ISDIR(s.mode),
+                .isfile = std.os.system.S.ISREG(s.mode),
+                .mtime = if (mtime < 0) 0 else @intCast(u64, mtime),
+                .size = @intCast(u64, s.size),
+            };
+        }
+    }
+};
+
 const Listing = struct {
     dirs: DirQueue = .{},
     files: std.ArrayList(File) = std.ArrayList(File).init(util.allocator),
@@ -42,36 +78,33 @@ const Listing = struct {
         return std.mem.lessThan(u8, a.name, b.name);
     }
 
-    // TODO windows
     fn add(self: *Listing, virtual: *const util.Path, parent: std.fs.Dir, fs: ?[]const u8) error{OutOfMemory}!?bool {
         const name = std.fs.path.basenamePosix(virtual.slice());
 
         // TODO symlink following option
         const stat = (
-            if (fs) |p| std.os.fstatat(parent.fd, p, 0)
-            else std.os.fstatat(parent.fd, name, std.os.AT.SYMLINK_NOFOLLOW)
+            if (fs) |p| MiniStat.stat(parent, p, true)
+            else MiniStat.stat(parent, name, false)
         ) catch |e| {
             if (fs == null) std.log.info("Unable to stat {}: {}, skipping", .{virtual, e})
             else std.log.warn("Unable to stat published path '{}': {}", .{virtual, e});
             return null;
         };
-        const isdir = std.os.system.S.ISDIR(stat.mode);
-        if (!isdir and !std.os.system.S.ISREG(stat.mode)) {
+        if (!stat.isdir and !stat.isfile) {
             if (fs == null) std.log.debug("Skipping non-regular file: {}", .{virtual})
             else std.log.warn("Published path '{}' is neither a file nor a directory", .{virtual});
             return null;
         }
-        if (isdir)
+        if (stat.isdir)
             try self.dirs.lst.append(.{ .name = try self.dirs.names.allocator.dupe(u8, name) })
         else {
-            const mtime = stat.mtime().tv_sec;
             try self.files.append(.{
                 .name = try self.names.allocator.dupe(u8, name),
-                .lastmod = if (mtime < 0) 0 else @intCast(u64, mtime),
-                .size = @intCast(u64, stat.size),
+                .lastmod = stat.mtime,
+                .size = stat.size,
             });
         }
-        return isdir;
+        return stat.isdir;
     }
 
     fn addFs(self: *Listing, dir: std.fs.Dir, mounts: *const config.Mounts, path: *util.Path) !void {
@@ -255,11 +288,10 @@ fn hashFile(ent: db.hash_queue.Entry) !void {
 
     // TODO: Validate if ent.size is still correct.
     // (Still subject to an unavoidable race condition, but may handle a few cases)
-    // TODO: Make this work on Windows.
     // TODO: Handle large files on 32bit systems.
-    // TODO: Non-mmap fallback? Even fixing the above, mmap /is/ slightly fragile.
-    var map = try std.os.mmap(null, ent.size, std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, 0);
-    defer std.os.munmap(map);
+    // TODO: Non-mmap fallback? Even fixing the 32bit problem, mmap /is/ slightly fragile.
+    var map = try util.mapFile(fd, 0, ent.size);
+    defer util.unmapFile(map);
 
     const piece_size = config.blake3_piece_size;
     const num_pieces = std.math.divCeil(u64, ent.size, piece_size) catch unreachable;

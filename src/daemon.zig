@@ -8,6 +8,11 @@ const util = @import("util.zig");
 const repometa = @import("repometa.zig");
 const config = @import("config.zig");
 
+// Technically, recent versions of Windows do have UNIX sockets and
+// std.net.has_unix_sockets can detect that, but for some reason it just causes
+// errors on my system.
+const has_unix_sockets = std.builtin.os.tag != .windows;
+
 fn serverAddress() std.net.Address {
     // Localhost IPv4 address if we can't use a UNIX address.
     // There's no real meaning behind the port number. It should be
@@ -15,7 +20,7 @@ fn serverAddress() std.net.Address {
     // somewhere and it makes the daemon-already-running check more fragile.
     const ipv4 = std.net.Address.initIp4(.{127,0,0,1}, 11649);
 
-    if (std.net.has_unix_sockets) {
+    if (has_unix_sockets) {
         var p = util.Path{};
         p.push(config.store_path) catch return ipv4;
         p.push("daemon-socket") catch return ipv4;
@@ -96,7 +101,7 @@ pub fn run() !void {
         return error.DaemonAlreadyRunning;
     } else |_| {}
 
-    if (serverAddress().any.family == std.os.AF.UNIX)
+    if (has_unix_sockets and serverAddress().any.family == std.os.AF.UNIX)
         std.fs.deleteFileAbsoluteZ(std.mem.sliceTo(std.meta.assumeSentinel(&serverAddress().un.path, 0), 0)) catch {};
 
     var server = std.net.StreamServer.init(.{ .reuse_address = true });

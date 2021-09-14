@@ -175,3 +175,26 @@ pub fn logLevelFromText(s: []const u8) ?std.log.Level {
     }
     return null;
 }
+
+
+// Wrapper around mmap()/MapViewOfFile()
+const winc = @cImport({ @cInclude("windows.h"); @cInclude("memoryapi.h"); });
+
+pub fn mapFile(fd: std.fs.File, offset: u64, length: usize) ![]const u8 {
+    if (std.builtin.os.tag == .windows) {
+        const handle = winc.CreateFileMapping(fd.handle, null, winc.PAGE_READONLY, 0, 0, null);
+        if (handle == winc.NULL) return error.CreateFileMapping;
+        const m = winc.MapViewOfFile(handle, winc.FILE_MAP_READ, @truncate(u32, offset>>32), @truncate(u32, offset), length);
+        if (m == winc.NULL) return error.MapViewOfFile;
+        _ = winc.CloseHandle(handle);
+        return @ptrCast([*]const u8, m)[0..length];
+    } else
+        return try std.os.mmap(null, length, std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, offset);
+}
+
+pub fn unmapFile(map: []const u8) void {
+    if (std.builtin.os.tag == .windows)
+        _ = winc.UnmapViewOfFile(map.ptr)
+    else
+        std.os.munmap(@alignCast(std.mem.page_size, map));
+}

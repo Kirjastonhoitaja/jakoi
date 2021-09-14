@@ -12,13 +12,12 @@ const db = @import("db.zig");
 const MetaFile = struct { b3: [32]u8, size: u64 };
 
 fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.Dir) !MetaFile {
-    // TODO: Windows.
     // Arguably it would be nicer to do a streaming hash while writing the
     // contents, so we don't have to read back what we just wrote. But eh, my
     // blake3.zig can't do that. Could use the std implementation for that.
     const b3 = blk: {
-        var map = try std.os.mmap(null, size, std.os.PROT.READ, std.os.MAP.PRIVATE, fd.handle, 0);
-        defer std.os.munmap(map);
+        var map = try util.mapFile(fd, 0, size);
+        defer util.unmapFile(map);
         break :blk blake3.hashPiece(0, map).root();
     };
 
