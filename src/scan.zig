@@ -7,6 +7,7 @@ const main = @import("main.zig");
 const config = @import("config.zig");
 const blake3 = @import("blake3.zig");
 const util = @import("util.zig");
+const repometa = @import("repometa.zig");
 
 
 const DirQueue = struct {
@@ -256,6 +257,7 @@ pub fn scan() !void {
             path.pop();
             stack.pop().deinit();
         }
+        repometa.flush(false);
     }
 }
 
@@ -324,6 +326,7 @@ fn hashThread() void {
         defer ent.deinit();
         hashFile(ent) catch |e|
             std.log.warn("Error hashing {s}: {}", .{ent.path, e});
+        repometa.flush(false);
     }
 }
 

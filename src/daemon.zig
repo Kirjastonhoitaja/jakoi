@@ -115,14 +115,12 @@ pub fn run() !void {
     // Timer should be configurable
     while (true) : (std.time.sleep(std.time.ns_per_hour)) {
         if (!config.mounts.isEmpty()) {
-            repo.start() catch |e| {
+            repo.start() catch |e|
                 std.log.warn("Error starting repository server: {}", .{ e });
-                continue;
-            };
             std.log.info("Initiating repository refresh", .{});
             try scan.scan();
             try scan.hash();
-            try repometa.write();
+            repometa.flush(true);
 
         } else {
             repo.stop() catch |e|

@@ -3,12 +3,9 @@
 
 const std = @import("std");
 const db = @import("db.zig");
-const scan = @import("scan.zig");
 const config = @import("config.zig");
 const util = @import("util.zig");
 const daemon = @import("daemon.zig");
-const tor = @import("tor.zig");
-const repometa = @import("repometa.zig");
 
 pub const log_level: std.log.Level = .debug;
 

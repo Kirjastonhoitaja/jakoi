@@ -14,6 +14,9 @@
 //   u256: blake3 listing hash
 // 0 4
 //   u64: number of entries in the blake3 listing
+// 0 5
+//   u8: 0 if the repository metadata is consistent with the DB,
+//       1 if there have been changes.
 //
 // 1 + <u64: dir_id> + <string: name>
 //   Directory entry; top-level dir has dir_id=0, others are generated from a sequence.
@@ -31,9 +34,6 @@
 // 2 + <u256: file_hash>
 //   u64: size
 //   rest: blake3 hash data
-//
-// 3 + <u256: file_hash>
-//   CBOR-encoded file metadata.
 //
 // 4 + <u256: file_hash> + <u64: path_hash>
 //   Value: path string
@@ -253,6 +253,13 @@ pub const Txn = struct {
         try t.put(&[_]u8{0,2}, &v);
     }
 
+    pub fn setRepoMeta(t: Txn, v: bool) !bool {
+        var cur = (try t.get(&.{0,5})) orelse &[_]u8{0};
+        if ((cur[0] == 1) == v) return v;
+        try t.put(&.{0,5}, &[_]u8{ if (v) 1 else 0 });
+        return !v;
+    }
+
     pub fn setHashList(t: Txn, v: [32]u8, num: u64) !void {
         if (num > 0) {
             try t.put(&[_]u8{0,3}, &v);
@@ -374,6 +381,7 @@ pub const DirIter = struct {
                 &toVal(dirKey(&buf, self.id, name)),
                 &toVal(std.mem.asBytes(&newid)),
                 c.MDB_NOOVERWRITE));
+        _ = try self.t.setRepoMeta(true);
         return newid;
     }
 
@@ -387,6 +395,7 @@ pub const DirIter = struct {
                 &toVal(dirKey(&buf, self.id, name)),
                 &toVal(std.mem.asBytes(&DirEntry.Unhashed{ .lastmod = lastmod, .size = size })),
                 c.MDB_NOOVERWRITE));
+        // No need to setRepoMeta here, unhashed files are not exported.
     }
 
     // Delete the entry last returned by next().
@@ -413,11 +422,13 @@ pub const DirIter = struct {
                     buf[0] = 3;
                     _ = try self.t.del(buf[0..33]);
                 }
+                _ = try self.t.setRepoMeta(true);
             },
             .dir => |dirid| {
                 var it = self.t.dirIter(dirid.*);
                 defer it.deinit();
                 while (try it.next()) |e| try it.del(e, parent);
+                _ = try self.t.setRepoMeta(true);
             },
         }
         try rcErr(c.mdb_cursor_del(self.cursor, 0));
@@ -526,6 +537,7 @@ pub const hash_queue = struct {
         buf[0] = 4;
         buf[33..41].* = blake3.hashPiece(0, e.path).root()[0..8].*;
         try t.put(buf[0..41], e.path);
+        _ = try t.setRepoMeta(true);
 
         // TODO: CBOR metadata
 

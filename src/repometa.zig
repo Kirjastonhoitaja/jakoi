@@ -11,7 +11,7 @@ const db = @import("db.zig");
 
 const MetaFile = struct { b3: [32]u8, size: u64 };
 
-fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.Dir) !MetaFile {
+fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File) !MetaFile {
     // Arguably it would be nicer to do a streaming hash while writing the
     // contents, so we don't have to read back what we just wrote. But eh, my
     // blake3.zig can't do that. Could use the std implementation for that.
@@ -21,8 +21,8 @@ fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.D
         break :blk blake3.hashPiece(0, map).root();
     };
 
-    var hex: [65]u8 = undefined;
-    try parent.renameZ(old, std.fmt.bufPrintZ(&hex, "{}", .{ std.fmt.fmtSliceHexLower(&b3) }) catch unreachable);
+    var buf: [100]u8 = undefined;
+    try config.store_dir.renameZ(old, std.fmt.bufPrintZ(&buf, "obj/{}", .{ std.fmt.fmtSliceHexLower(&b3) }) catch unreachable);
     return MetaFile{ .b3 = b3, .size = size };
 }
 
@@ -78,17 +78,17 @@ fn hashAndRename(old: [:0]const u8, size: u64, fd: std.fs.File, parent: std.fs.D
 //   - Requires more network round-trips.
 //   So I'll be sticking with the current approach until I have benchmarks
 //   showing that O(n) sync is really too slow.
-fn writeDirList(t: db.Txn, obj_dir: std.fs.Dir) !MetaFile {
-    var fd = try obj_dir.createFileZ(".tmp-dirlist", .{.read=true});
+fn writeDirList(t: db.Txn) !MetaFile {
+    var fd = try config.store_dir.createFileZ("obj/.tmp-dirlist", .{.read=true});
     defer fd.close();
-    errdefer obj_dir.deleteFileZ(".tmp-dirlist") catch {};
+    errdefer config.store_dir.deleteFileZ("obj/.tmp-dirlist") catch {};
 
     var buf = std.io.bufferedWriter(fd.writer());
     var cnt = std.io.countingWriter(buf.writer());
     var wr = cbor.writer(cnt.writer());
     try writeDirListDir(t, 0, &wr);
     try buf.flush();
-    return hashAndRename(".tmp-dirlist", cnt.bytes_written, fd, obj_dir);
+    return hashAndRename("obj/.tmp-dirlist", cnt.bytes_written, fd);
 }
 
 
@@ -138,10 +138,10 @@ fn writeDirListDir(t: db.Txn, dir_id: u64, wr: anytype) (std.fs.File.WriteError 
 }
 
 
-fn writeHashList(t: db.Txn, obj_dir: std.fs.Dir) !?MetaFile {
-    var fd = try obj_dir.createFileZ(".tmp-hashlist", .{.read=true});
+fn writeHashList(t: db.Txn) !?MetaFile {
+    var fd = try config.store_dir.createFileZ("obj/.tmp-hashlist", .{.read=true});
     defer fd.close();
-    errdefer obj_dir.deleteFileZ(".tmp-hashlist") catch {};
+    errdefer config.store_dir.deleteFileZ("obj/.tmp-hashlist") catch {};
 
     var buf = std.io.bufferedWriter(fd.writer());
     var cnt = std.io.countingWriter(buf.writer());
@@ -151,10 +151,10 @@ fn writeHashList(t: db.Txn, obj_dir: std.fs.Dir) !?MetaFile {
     while (try it.next()) |h| try wr.writeAll(&h);
     try buf.flush();
     if (cnt.bytes_written == 0) {
-        obj_dir.deleteFileZ(".tmp-hashlist") catch {};
+        config.store_dir.deleteFileZ(".tmp-hashlist") catch {};
         return null;
     }
-    return try hashAndRename(".tmp-hashlist", cnt.bytes_written, fd, obj_dir);
+    return try hashAndRename("obj/.tmp-hashlist", cnt.bytes_written, fd);
 }
 
 
@@ -177,16 +177,56 @@ fn storeMetaFiles(t: db.Txn, dirlist: MetaFile, hashlist: ?MetaFile) !OldFiles {
     return old;
 }
 
-pub fn write() !void {
-    try config.store_dir.makePath("obj");
-    var obj_dir = try config.store_dir.openDir("obj", .{});
-    defer obj_dir.close();
 
-    const dirlist = try db.txn(.ro, writeDirList, .{ obj_dir });
-    const hashlist = try db.txn(.ro, writeHashList, .{ obj_dir });
+// Flush every 5 minutes, if there are changes.
+const throttle_timeout = 5*std.time.ns_per_min;
 
-    const old = try db.txn(.rw, storeMetaFiles, .{ dirlist, hashlist });
-    var hex: [65]u8 = undefined;
-    if (old.dirlist)  |f| obj_dir.deleteFileZ(std.fmt.bufPrintZ(&hex, "{}", .{ std.fmt.fmtSliceHexLower(&f) }) catch unreachable) catch {};
-    if (old.hashlist) |f| obj_dir.deleteFileZ(std.fmt.bufPrintZ(&hex, "{}", .{ std.fmt.fmtSliceHexLower(&f) }) catch unreachable) catch {};
+var check_lock = std.Thread.Mutex{};
+var throttle_timer: ?std.time.Timer = null;
+var thread_busy = false; // Set if a thread is already checking/writing
+
+// Should be called at regular intervals, ideally whenever something has
+// changed to the repository metadata. Can be called from any thread.
+pub fn flush(force_check: bool) void {
+    {
+        var lock = check_lock.acquire();
+        defer lock.release();
+        if (thread_busy) return;
+        if (throttle_timer) |t|
+            if (!force_check and t.read() < throttle_timeout) return;
+        thread_busy = true;
+    }
+    defer {
+        var lock = check_lock.acquire();
+        defer lock.release();
+        thread_busy = false;
+        throttle_timer = std.time.Timer.start() catch unreachable;
+    }
+    // Mark RepoMeta as clean before writing, so that a concurrent change can
+    // mark it dirty again.
+    const dirty = db.txn(.rw, db.Txn.setRepoMeta, .{ false }) catch |e| {
+        std.log.err("Error checking database for metadata status: {}", .{e});
+        return;
+    };
+    if (!dirty) return;
+    std.log.debug("Flushing repository metadata", .{});
+
+    config.store_dir.makePath("obj") catch {};
+    const dirlist = db.txn(.ro, writeDirList, .{}) catch |e| {
+        std.log.err("Error writing dirlist metadata: {}", .{e});
+        return;
+    };
+    const hashlist = db.txn(.ro, writeHashList, .{}) catch |e| {
+        std.log.err("Error writing hashlist metadata: {}", .{e});
+        return;
+    };
+
+    const old = db.txn(.rw, storeMetaFiles, .{ dirlist, hashlist }) catch |e| {
+        std.log.err("Error saving repository metadata: {}", .{e});
+        return;
+    };
+
+    var buf: [100]u8 = undefined;
+    if (old.dirlist)  |f| config.store_dir.deleteFileZ(std.fmt.bufPrintZ(&buf, "obj/{}", .{ std.fmt.fmtSliceHexLower(&f) }) catch unreachable) catch {};
+    if (old.hashlist) |f| config.store_dir.deleteFileZ(std.fmt.bufPrintZ(&buf, "obj/{}", .{ std.fmt.fmtSliceHexLower(&f) }) catch unreachable) catch {};
 }
